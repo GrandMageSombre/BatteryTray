@@ -130,13 +130,15 @@ namespace BatteryTray
             _lastX = x;
             _lastY = y;
 
+            bool needsUpdate = false;
             if (_dirty)
             {
                 RenderSurface();
                 _dirty = false;
+                needsUpdate = true;
             }
 
-            if (!Visible || moved)
+            if (needsUpdate || !Visible || moved)
             {
                 UpdateLayered(x, y);
                 if (!Visible) Show();
