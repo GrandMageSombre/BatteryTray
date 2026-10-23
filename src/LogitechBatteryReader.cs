@@ -1,0 +1,470 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+namespace BatteryTray
+{
+    internal sealed class DeviceBattery
+    {
+        public string Key;
+        public string Label;
+        public int Percent = -1;
+        public bool Supported;
+        public bool Stale;
+        public string Detail = "";
+    }
+
+    internal sealed class BatterySnapshot
+    {
+        public readonly List<DeviceBattery> Devices = new List<DeviceBattery>();
+
+        public bool HasSupported
+        {
+            get
+            {
+                for (int i = 0; i < Devices.Count; i++)
+                {
+                    if (Devices[i].Supported) return true;
+                }
+                return false;
+            }
+        }
+
+        public DeviceBattery Primary
+        {
+            get
+            {
+                for (int i = 0; i < Devices.Count; i++)
+                {
+                    if (Devices[i].Supported) return Devices[i];
+                }
+                return null;
+            }
+        }
+    }
+
+    internal sealed class HidInterfaceInfo
+    {
+        public string Path;
+        public ushort Vid;
+        public ushort Pid;
+        public ushort UsagePage;
+        public int InputReportLength;
+        public int OutputReportLength;
+    }
+
+    internal static class BatteryReader
+    {
+        private const ushort LogitechVid = 0x046D;
+        private const ushort SonixVid = 0x26CE;
+        private const ushort BatteryStatusFeature = 0x1000;
+        private const ushort UnifiedBatteryFeature = 0x1004;
+        private const byte SoftwareId = 0x0C;
+
+        public static BatterySnapshot ReadAll()
+        {
+            BatterySnapshot snapshot = new BatterySnapshot();
+            List<HidInterfaceInfo> interfaces = EnumerateHidInterfaces();
+            Dictionary<string, List<HidInterfaceInfo>> receivers = new Dictionary<string, List<HidInterfaceInfo>>();
+
+            for (int i = 0; i < interfaces.Count; i++)
+            {
+                HidInterfaceInfo info = interfaces[i];
+                if (info.Vid == 0 || info.UsagePage == 0) continue;
+                string key = string.Format(CultureInfo.InvariantCulture, "{0:X4}:{1:X4}", info.Vid, info.Pid);
+                List<HidInterfaceInfo> group;
+                if (!receivers.TryGetValue(key, out group))
+                {
+                    group = new List<HidInterfaceInfo>();
+                    receivers.Add(key, group);
+                }
+                group.Add(info);
+            }
+
+            bool anyReceiver = false;
+            foreach (KeyValuePair<string, List<HidInterfaceInfo>> pair in receivers)
+            {
+                ushort vid = pair.Value[0].Vid;
+                if (vid == LogitechVid)
+                {
+                    anyReceiver = true;
+                    ReadLogitechReceiver(pair.Key, pair.Value, snapshot);
+                }
+                else if (vid == SonixVid)
+                {
+                    anyReceiver = true;
+                    snapshot.Devices.Add(new DeviceBattery
+                    {
+                        Key = "sonix:" + pair.Key,
+                        Label = "SONiX 2.4G 接收器",
+                        Supported = false,
+                        Percent = -1,
+                        Detail = "该接收器未提供标准 HID 电量特性，无法读取"
+                    });
+                }
+            }
+
+            if (!anyReceiver)
+            {
+                snapshot.Devices.Add(new DeviceBattery
+                {
+                    Key = "none",
+                    Label = "2.4G 接收器",
+                    Supported = false,
+                    Percent = -1,
+                    Detail = "未检测到 2.4G 接收器"
+                });
+            }
+
+            return snapshot;
+        }
+
+        private static void ReadLogitechReceiver(string receiverKey, List<HidInterfaceInfo> interfaces, BatterySnapshot snapshot)
+        {
+            List<HidInterfaceInfo> candidates = new List<HidInterfaceInfo>();
+            for (int i = 0; i < interfaces.Count; i++)
+            {
+                HidInterfaceInfo info = interfaces[i];
+                if (info.UsagePage == 0xFF00 && info.OutputReportLength >= 7 && info.InputReportLength >= 7)
+                    candidates.Add(info);
+            }
+            candidates.Sort(delegate(HidInterfaceInfo a, HidInterfaceInfo b)
+            {
+                return b.OutputReportLength.CompareTo(a.OutputReportLength);
+            });
+
+            for (int c = 0; c < candidates.Count; c++)
+            {
+                using (HidConnection connection = HidConnection.Open(candidates[c].Path))
+                {
+                    if (connection == null) continue;
+                    byte reportId = connection.OutputReportLength >= 20 ? (byte)0x11 : (byte)0x10;
+                    List<DeviceBattery> found = ReadLogitechDevices(connection, reportId, receiverKey);
+                    if (found.Count > 0)
+                    {
+                        snapshot.Devices.AddRange(found);
+                        return;
+                    }
+                }
+            }
+
+            snapshot.Devices.Add(new DeviceBattery
+            {
+                Key = receiverKey + ":receiver",
+                Label = "罗技 2.4G 接收器",
+                Supported = false,
+                Percent = -1,
+                Detail = "未发现可读取电量的设备（设备可能处于休眠或未配对）"
+            });
+        }
+
+        private static List<DeviceBattery> ReadLogitechDevices(HidConnection connection, byte reportId, string receiverKey)
+        {
+            List<DeviceBattery> result = new List<DeviceBattery>();
+            for (int index = 1; index <= 6; index++)
+            {
+                ushort feature = BatteryStatusFeature;
+                int featureIndex = connection.GetFeature(index, feature, reportId, 3, 350);
+                if (featureIndex <= 0)
+                {
+                    feature = UnifiedBatteryFeature;
+                    featureIndex = connection.GetFeature(index, feature, reportId, 3, 350);
+                }
+                if (featureIndex <= 0) continue;
+
+                byte[] response = connection.Call(index, featureIndex, 0, reportId, null, 2, 350);
+                if (response == null || HidConnection.IsErrorResponse(response)) continue;
+
+                int percent = response[4];
+                if (feature == BatteryStatusFeature && percent == 0) percent = -1;
+                else if (percent > 100) percent = 100;
+
+                DeviceBattery device = new DeviceBattery
+                {
+                    Key = receiverKey + ":" + index.ToString(CultureInfo.InvariantCulture),
+                    Label = "罗技 2.4G 设备 " + index.ToString(CultureInfo.InvariantCulture),
+                    Supported = true,
+                    Percent = percent,
+                    Detail = feature == BatteryStatusFeature
+                        ? "电池状态特性：下一档 " + response[5].ToString(CultureInfo.InvariantCulture) + "%，状态 0x" + response[6].ToString("X2", CultureInfo.InvariantCulture)
+                        : "统一电池特性：状态 0x" + response[6].ToString("X2", CultureInfo.InvariantCulture)
+                };
+                result.Add(device);
+            }
+            return result;
+        }
+
+        private static List<HidInterfaceInfo> EnumerateHidInterfaces()
+        {
+            List<HidInterfaceInfo> result = new List<HidInterfaceInfo>();
+            Guid guid = Native.HidInterfaceGuid;
+            IntPtr set = Native.SetupDiGetClassDevs(ref guid, IntPtr.Zero, IntPtr.Zero, Native.DIGCF_PRESENT | Native.DIGCF_DEVICEINTERFACE);
+            if (!Native.IsValidHandle(set)) return result;
+
+            try
+            {
+                Native.SP_DEVICE_INTERFACE_DATA data = new Native.SP_DEVICE_INTERFACE_DATA();
+                data.cbSize = Marshal.SizeOf(typeof(Native.SP_DEVICE_INTERFACE_DATA));
+                for (uint i = 0; ; i++)
+                {
+                    if (!Native.SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref guid, i, ref data)) break;
+                    string path = GetInterfacePath(set, ref data);
+                    if (string.IsNullOrEmpty(path)) continue;
+
+                    HidInterfaceInfo info = new HidInterfaceInfo();
+                    info.Path = path;
+                    ParseVidPid(path, out info.Vid, out info.Pid);
+
+                    IntPtr handle = Native.CreateFile(path, 0, Native.FILE_SHARE_READ | Native.FILE_SHARE_WRITE, IntPtr.Zero, Native.OPEN_EXISTING, 0, IntPtr.Zero);
+                    if (Native.IsValidHandle(handle))
+                    {
+                        try
+                        {
+                            Native.HIDP_CAPS caps = GetCaps(handle);
+                            info.UsagePage = caps.UsagePage;
+                            info.InputReportLength = caps.InputReportByteLength;
+                            info.OutputReportLength = caps.OutputReportByteLength;
+                        }
+                        finally
+                        {
+                            Native.CloseHandle(handle);
+                        }
+                    }
+                    result.Add(info);
+                }
+            }
+            finally
+            {
+                Native.SetupDiDestroyDeviceInfoList(set);
+            }
+            return result;
+        }
+
+        private static string GetInterfacePath(IntPtr set, ref Native.SP_DEVICE_INTERFACE_DATA data)
+        {
+            int required = 0;
+            Native.SetupDiGetDeviceInterfaceDetail(set, ref data, IntPtr.Zero, 0, ref required, IntPtr.Zero);
+            if (required <= 0) return null;
+
+            IntPtr buffer = Marshal.AllocHGlobal(required);
+            try
+            {
+                Marshal.WriteInt32(buffer, IntPtr.Size == 8 ? 8 : 6);
+                if (!Native.SetupDiGetDeviceInterfaceDetail(set, ref data, buffer, required, ref required, IntPtr.Zero))
+                    return null;
+                return Marshal.PtrToStringAuto(new IntPtr(buffer.ToInt64() + 4));
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static void ParseVidPid(string path, out ushort vid, out ushort pid)
+        {
+            vid = 0;
+            pid = 0;
+            string upper = path.ToUpperInvariant();
+            int vidIndex = upper.IndexOf("VID_", StringComparison.Ordinal);
+            int pidIndex = upper.IndexOf("PID_", StringComparison.Ordinal);
+            if (vidIndex >= 0 && vidIndex + 8 <= upper.Length)
+                ushort.TryParse(upper.Substring(vidIndex + 4, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out vid);
+            if (pidIndex >= 0 && pidIndex + 8 <= upper.Length)
+                ushort.TryParse(upper.Substring(pidIndex + 4, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out pid);
+        }
+
+        private static Native.HIDP_CAPS GetCaps(IntPtr handle)
+        {
+            Native.HIDP_CAPS caps = new Native.HIDP_CAPS();
+            caps.Reserved = new ushort[17];
+            caps.Reserved2 = new ushort[10];
+            IntPtr preparsed;
+            if (Native.HidD_GetPreparsedData(handle, out preparsed))
+            {
+                try
+                {
+                    Native.HidP_GetCaps(preparsed, ref caps);
+                }
+                finally
+                {
+                    Native.HidD_FreePreparsedData(preparsed);
+                }
+            }
+            return caps;
+        }
+
+        private sealed class HidConnection : IDisposable
+        {
+            private IntPtr _handle;
+            public readonly int InputReportLength;
+            public readonly int OutputReportLength;
+
+            private HidConnection(IntPtr handle, int inputLength, int outputLength)
+            {
+                _handle = handle;
+                InputReportLength = inputLength;
+                OutputReportLength = outputLength;
+            }
+
+            public static HidConnection Open(string path)
+            {
+                IntPtr handle = Native.CreateFile(path,
+                    Native.GENERIC_READ | Native.GENERIC_WRITE,
+                    Native.FILE_SHARE_READ | Native.FILE_SHARE_WRITE,
+                    IntPtr.Zero, Native.OPEN_EXISTING, Native.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+                if (!Native.IsValidHandle(handle)) return null;
+
+                Native.HIDP_CAPS caps = GetCaps(handle);
+                if (caps.InputReportByteLength == 0 || caps.OutputReportByteLength == 0)
+                {
+                    Native.CloseHandle(handle);
+                    return null;
+                }
+                return new HidConnection(handle, caps.InputReportByteLength, caps.OutputReportByteLength);
+            }
+
+            public int GetFeature(int deviceIndex, ushort feature, byte reportId, int attempts, int timeout)
+            {
+                byte[] parameters = new byte[] { (byte)(feature >> 8), (byte)(feature & 0xFF) };
+                for (int attempt = 0; attempt < attempts; attempt++)
+                {
+                    byte[] response = Call(deviceIndex, 0x00, 0, reportId, parameters, 1, timeout);
+                    if (response != null)
+                    {
+                        if (IsErrorResponse(response)) return -1;
+                        return response[4];
+                    }
+                    if (attempt + 1 < attempts) Thread.Sleep(120);
+                }
+                return -1;
+            }
+
+            public static bool IsErrorResponse(byte[] response)
+            {
+                return response[2] == 0x8F || (response[2] == 0xFF && response[3] == 0x8F);
+            }
+
+            public byte[] Call(int deviceIndex, int featureIndex, int function, byte reportId, byte[] parameters, int attempts, int timeout)
+            {
+                int length = reportId == 0x11 ? 20 : 7;
+                if (OutputReportLength > length) length = OutputReportLength;
+                byte[] request = new byte[length];
+                request[0] = reportId;
+                request[1] = (byte)deviceIndex;
+                request[2] = (byte)featureIndex;
+                request[3] = (byte)((function << 4) | SoftwareId);
+                if (parameters != null)
+                {
+                    int copy = Math.Min(parameters.Length, request.Length - 4);
+                    Array.Copy(parameters, 0, request, 4, copy);
+                }
+
+                for (int attempt = 0; attempt < attempts; attempt++)
+                {
+                    byte[] response = Exchange(request, deviceIndex, featureIndex, timeout);
+                    if (response != null) return response;
+                }
+                return null;
+            }
+
+            private byte[] Exchange(byte[] request, int deviceIndex, int featureIndex, int timeout)
+            {
+                GCHandle requestPin = GCHandle.Alloc(request, GCHandleType.Pinned);
+                ManualResetEvent ioEvent = new ManualResetEvent(false);
+                IntPtr eventHandle = ioEvent.SafeWaitHandle.DangerousGetHandle();
+                try
+                {
+                    NativeOverlapped writeOverlapped = new NativeOverlapped();
+                    writeOverlapped.EventHandle = eventHandle;
+                    int written;
+                    bool ok = Native.WriteFile(_handle, requestPin.AddrOfPinnedObject(), request.Length, out written, ref writeOverlapped);
+                    if (!ok)
+                    {
+                        int error = Marshal.GetLastWin32Error();
+                        if (error != 997) return null;
+                        if (!ioEvent.WaitOne(timeout))
+                        {
+                            CancelAndWait(ref writeOverlapped);
+                            return null;
+                        }
+                    }
+                    int transferred;
+                    Native.GetOverlappedResult(_handle, ref writeOverlapped, out transferred, false);
+                    ioEvent.Reset();
+
+                    DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeout);
+                    while (DateTime.UtcNow < deadline)
+                    {
+                        int bufferLength = Math.Max(InputReportLength, 64);
+                        IntPtr readBuffer = Marshal.AllocHGlobal(bufferLength);
+                        try
+                        {
+                            NativeOverlapped readOverlapped = new NativeOverlapped();
+                            readOverlapped.EventHandle = eventHandle;
+                            int readCount;
+                            ok = Native.ReadFile(_handle, readBuffer, bufferLength, out readCount, ref readOverlapped);
+                            if (!ok)
+                            {
+                                int error = Marshal.GetLastWin32Error();
+                                if (error != 997) break;
+                                int remaining = (int)Math.Max(10, (deadline - DateTime.UtcNow).TotalMilliseconds);
+                                if (!ioEvent.WaitOne(remaining))
+                                {
+                                    CancelAndWait(ref readOverlapped);
+                                    break;
+                                }
+                            }
+                            ioEvent.Reset();
+                            if (!Native.GetOverlappedResult(_handle, ref readOverlapped, out readCount, false)) break;
+
+                            if (readCount >= 7)
+                            {
+                                int copyLength = Math.Min(readCount, 64);
+                                byte[] received = new byte[copyLength];
+                                Marshal.Copy(readBuffer, received, 0, copyLength);
+                                if (IsMatchingResponse(received, request, deviceIndex, featureIndex))
+                                    return received;
+                            }
+                        }
+                        finally
+                        {
+                            Marshal.FreeHGlobal(readBuffer);
+                        }
+                    }
+                    return null;
+                }
+                finally
+                {
+                    requestPin.Free();
+                    ioEvent.Close();
+                }
+            }
+
+            private void CancelAndWait(ref NativeOverlapped overlapped)
+            {
+                Native.CancelIo(_handle);
+                int transferred;
+                Native.GetOverlappedResult(_handle, ref overlapped, out transferred, true);
+            }
+
+            private static bool IsMatchingResponse(byte[] buffer, byte[] request, int deviceIndex, int featureIndex)
+            {
+                if (buffer[0] != request[0] || buffer[1] != deviceIndex) return false;
+                if (buffer[2] == 0xFF && buffer[3] == 0x8F) return true;
+                if (buffer[2] == 0x8F) return true;
+                return buffer[2] == featureIndex && (buffer[3] & 0x0F) == SoftwareId;
+            }
+
+            public void Dispose()
+            {
+                if (_handle != IntPtr.Zero)
+                {
+                    Native.CloseHandle(_handle);
+                    _handle = IntPtr.Zero;
+                }
+            }
+        }
+    }
+}

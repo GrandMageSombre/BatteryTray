@@ -1,0 +1,9 @@
+# 编译产物
+/BatteryTray.exe
+*.pdb
+bin/
+obj/
+
+# IDE 本地文件
+.vs/
+*.user
