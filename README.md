@@ -60,6 +60,12 @@ $sources = Get-ChildItem .\src\*.cs | ForEach-Object { $_.FullName }
 
 `IBatteryProvider` 是品牌适配的扩展点，新增协议实现该接口即可接入。
 
+## 文档
+
+- [版本说明](docs/版本说明.md)：逐版本的新增、修复、验证与遗留问题
+- [审查报告](docs/审查报告.md)：第 1–8 轮代码审查记录（根因、处置、误报澄清）
+- [文档索引](docs/README.md)：文档维护约定
+
 ## 目录结构
 
 ```
@@ -71,8 +77,10 @@ src/
   Native.cs                  Win32 P/Invoke 声明
   AssemblyInfo.cs            程序集元数据
 lib/winrt/                   WinRT 编译参考元数据
-版本说明.md                  逐版本变更记录与技术细节
-审查报告*.md                 代码审查记录
+docs/
+  README.md                  文档索引
+  版本说明.md                逐版本变更记录与技术细节
+  审查报告.md                第 1–8 轮代码审查记录
 ```
 
 ## 已知限制

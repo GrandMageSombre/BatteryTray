@@ -7,3 +7,6 @@ obj/
 # IDE 本地文件
 .vs/
 *.user
+
+# 工作区本地数据
+.workbuddy/
