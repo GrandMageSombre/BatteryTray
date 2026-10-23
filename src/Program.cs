@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -56,6 +57,7 @@ namespace BatteryTray
         private readonly DevicePanelForm _panel;
         private readonly DeviceChangeWindow _deviceWindow;
         private readonly System.Windows.Forms.Timer _timer;
+        private readonly System.Windows.Forms.Timer _watchdog;
         private BatterySnapshot _snapshot;
         private DateTime _lastSuccess = DateTime.MinValue;
         private Icon _trayIcon;
@@ -66,8 +68,11 @@ namespace BatteryTray
         private bool _suppressAutoStartEvent;
         private int _polling;
         private int _refreshPending;
+        private int _pollGeneration;
+        private int _pollStartedTicks;
         private int _cachedPercent;
         private int _cachedCategory;
+        private static string _lastSnapshotSignature;
 
         public TrayContext()
         {
@@ -126,6 +131,11 @@ namespace BatteryTray
             _timer.Interval = PollIntervalMilliseconds;
             _timer.Tick += delegate { RefreshNow(); };
             _timer.Start();
+
+            _watchdog = new System.Windows.Forms.Timer();
+            _watchdog.Interval = 1000;
+            _watchdog.Tick += delegate { WatchdogTick(); };
+            _watchdog.Start();
 
             _deviceWindow = new DeviceChangeWindow();
             _deviceWindow.DeviceChanged += delegate { RefreshNow(); };
@@ -199,6 +209,9 @@ namespace BatteryTray
                 return;
             }
 
+            int generation = Volatile.Read(ref _pollGeneration);
+            _pollStartedTicks = Environment.TickCount;
+
             ThreadPool.QueueUserWorkItem(delegate
             {
                 BatterySnapshot snapshot;
@@ -217,14 +230,18 @@ namespace BatteryTray
                         Detail = "读取失败：" + ex.Message
                     });
                 }
-                finally
-                {
-                    Interlocked.Exchange(ref _polling, 0);
-                }
 
+                bool current = generation == Volatile.Read(ref _pollGeneration);
+                if (!current) return;
+
+                Interlocked.Exchange(ref _polling, 0);
                 try
                 {
-                    _ui.Post(delegate { ApplySnapshot(snapshot); }, null);
+                    _ui.Post(delegate
+                    {
+                        if (generation == Volatile.Read(ref _pollGeneration))
+                            ApplySnapshot(snapshot);
+                    }, null);
                 }
                 catch
                 {
@@ -235,9 +252,24 @@ namespace BatteryTray
             });
         }
 
+        private void WatchdogTick()
+        {
+            if (_exiting) return;
+            if (Interlocked.CompareExchange(ref _polling, 0, 0) != 1) return;
+            if (unchecked(Environment.TickCount - _pollStartedTicks) <= 3000) return;
+
+            // 读取线程可能卡在 HID 驱动取消等待中：废弃旧代际，允许新线程重新枚举。
+            Interlocked.Increment(ref _pollGeneration);
+            Interlocked.Exchange(ref _polling, 0);
+            Interlocked.Exchange(ref _refreshPending, 0);
+            RefreshNow();
+        }
+
         private void ApplySnapshot(BatterySnapshot fresh)
         {
             if (_exiting || fresh == null) return;
+
+            LogSnapshot(fresh);
 
             // 以最新枚举结果为准：设备/接收器一旦消失或不再上报，旧电量立即清除。
             _snapshot = fresh;
@@ -267,6 +299,37 @@ namespace BatteryTray
             }
 
             UpdateDisplay();
+        }
+
+        private static void LogSnapshot(BatterySnapshot snapshot)
+        {
+            StringBuilder signature = new StringBuilder();
+            signature.Append("count=").Append(snapshot.Devices.Count)
+                .Append(" supported=").Append(snapshot.HasSupported).Append(' ');
+            for (int i = 0; i < snapshot.Devices.Count; i++)
+            {
+                DeviceBattery device = snapshot.Devices[i];
+                signature.Append('[').Append(device.Key).Append('/')
+                    .Append(device.Category).Append('/')
+                    .Append(device.Connection).Append('/')
+                    .Append(device.Supported).Append('/')
+                    .Append(device.Percent).Append(']');
+            }
+
+            string text = signature.ToString();
+            if (text == _lastSnapshotSignature) return;
+            _lastSnapshotSignature = text;
+
+            try
+            {
+                string path = Path.Combine(Path.GetTempPath(), "BatteryTray.snapshot.log");
+                if (File.Exists(path) && new FileInfo(path).Length > 256 * 1024)
+                    File.Delete(path);
+                File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " " + text + Environment.NewLine);
+            }
+            catch
+            {
+            }
         }
 
         private void UpdateDisplay()
@@ -455,6 +518,8 @@ namespace BatteryTray
             _exiting = true;
             _timer.Stop();
             _timer.Dispose();
+            _watchdog.Stop();
+            _watchdog.Dispose();
 
             _notify.ContextMenuStrip = null;
             _notify.Visible = false;
