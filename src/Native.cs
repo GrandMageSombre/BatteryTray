@@ -27,6 +27,9 @@ namespace BatteryTray
         public const uint SWP_SHOWWINDOW = 0x0040;
         public const uint SWP_NOOWNERZORDER = 0x0200;
         public const uint ULW_ALPHA = 0x00000002;
+
+        public const int DBT_DEVTYP_DEVICEINTERFACE = 0x00000005;
+        public const uint DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000;
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
 
         public static readonly Guid HidInterfaceGuid = new Guid("4D1E55B2-F16F-11CF-88CB-001111000030");
@@ -116,6 +119,16 @@ namespace BatteryTray
             public byte AlphaFormat;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DEV_BROADCAST_DEVICEINTERFACE
+        {
+            public int dbcc_size;
+            public int dbcc_devicetype;
+            public int dbcc_reserved;
+            public Guid dbcc_classguid;
+            public short dbcc_name;
+        }
+
         [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr SetupDiGetClassDevs(ref Guid classGuid, IntPtr enumerator, IntPtr parent, uint flags);
 
@@ -178,6 +191,13 @@ namespace BatteryTray
 
         [DllImport("user32.dll")]
         public static extern bool IsWindowVisible(IntPtr window);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr RegisterDeviceNotification(IntPtr recipient,
+            ref DEV_BROADCAST_DEVICEINTERFACE filter, uint flags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UnregisterDeviceNotification(IntPtr handle);
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool UpdateLayeredWindow(IntPtr window, IntPtr destinationDc, ref POINT destination,

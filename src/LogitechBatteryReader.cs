@@ -246,7 +246,7 @@ namespace BatteryTray
             for (int index = 1; index <= 6; index++)
             {
                 ushort feature = BatteryStatusFeature;
-                int timeout = index <= 2 ? 300 : 200;
+                int timeout = index <= 2 ? 200 : 120;
                 int statusFeature = connection.GetFeature(index, feature, reportId, 1, timeout);
                 int unifiedFeature = -1;
                 int featureIndex = statusFeature;
@@ -267,14 +267,14 @@ namespace BatteryTray
                 byte[] response;
                 if (feature == UnifiedBatteryFeature)
                 {
-                    byte[] capabilities = connection.Call(index, featureIndex, 0, reportId, null, 1, 300);
+                    byte[] capabilities = connection.Call(index, featureIndex, 0, reportId, null, 1, 200);
                     if (capabilities == null || HidConnection.IsErrorResponse(capabilities)) continue;
                     if ((capabilities[5] & 0x02) == 0) continue;
-                    response = connection.Call(index, featureIndex, 1, reportId, null, 1, 300);
+                    response = connection.Call(index, featureIndex, 1, reportId, null, 1, 200);
                 }
                 else
                 {
-                    response = connection.Call(index, featureIndex, 0, reportId, null, 1, 300);
+                    response = connection.Call(index, featureIndex, 0, reportId, null, 1, 200);
                 }
                 if (response == null || HidConnection.IsErrorResponse(response)) continue;
 
@@ -311,7 +311,7 @@ namespace BatteryTray
         private static void AddUnsupportedLogitechDevice(HidConnection connection, int index, byte reportId,
             string receiverKey, List<HidInterfaceInfo> group, List<DeviceBattery> result)
         {
-            int nameFeature = connection.GetFeature(index, 0x0005, reportId, 1, 200);
+            int nameFeature = connection.GetFeature(index, 0x0005, reportId, 1, 150);
             if (nameFeature <= 0) return;
 
             string name = ReadLogitechName(connection, index, nameFeature, reportId).Trim();
@@ -336,10 +336,10 @@ namespace BatteryTray
 
         private static DeviceCategory GetLogitechCategory(HidConnection connection, int index, byte reportId, List<HidInterfaceInfo> group)
         {
-            int featureIndex = connection.GetFeature(index, 0x0005, reportId, 1, 300);
+            int featureIndex = connection.GetFeature(index, 0x0005, reportId, 1, 200);
             if (featureIndex > 0)
             {
-                byte[] typeResponse = connection.Call(index, featureIndex, 2, reportId, null, 1, 300);
+                byte[] typeResponse = connection.Call(index, featureIndex, 2, reportId, null, 1, 200);
                 if (typeResponse != null && !HidConnection.IsErrorResponse(typeResponse))
                 {
                     switch (typeResponse[4])
@@ -364,14 +364,14 @@ namespace BatteryTray
 
         private static string ReadLogitechName(HidConnection connection, int index, int featureIndex, byte reportId)
         {
-            byte[] lengthResponse = connection.Call(index, featureIndex, 0, reportId, null, 1, 300);
+            byte[] lengthResponse = connection.Call(index, featureIndex, 0, reportId, null, 1, 200);
             if (lengthResponse == null || HidConnection.IsErrorResponse(lengthResponse)) return "";
 
             int length = lengthResponse[4];
             StringBuilder name = new StringBuilder();
             for (int offset = 0; offset < length; offset += 16)
             {
-                byte[] chunk = connection.Call(index, featureIndex, 1, reportId, new byte[] { (byte)offset }, 1, 300);
+                byte[] chunk = connection.Call(index, featureIndex, 1, reportId, new byte[] { (byte)offset }, 1, 200);
                 if (chunk == null || HidConnection.IsErrorResponse(chunk)) break;
                 int end = Math.Min(chunk.Length, 20);
                 for (int i = 4; i < end; i++)

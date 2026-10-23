@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -44,7 +45,7 @@ namespace BatteryTray
 
     internal sealed class TrayContext : ApplicationContext
     {
-        private const int PollIntervalMilliseconds = 2000;
+        private const int PollIntervalMilliseconds = 1000;
         private const string SettingsKeyPath = @"Software\2.4GBattery";
 
         private readonly SynchronizationContext _ui;
@@ -65,7 +66,6 @@ namespace BatteryTray
         private bool _suppressAutoStartEvent;
         private int _polling;
         private int _refreshPending;
-        private int _failedPolls;
         private int _cachedPercent;
         private int _cachedCategory;
 
@@ -239,25 +239,12 @@ namespace BatteryTray
         {
             if (_exiting || fresh == null) return;
 
-            bool receiverAbsent = false;
-            for (int i = 0; i < fresh.Devices.Count; i++)
-            {
-                if (fresh.Devices[i].Key == "none") receiverAbsent = true;
-            }
-
-            if (_snapshot == null || receiverAbsent)
-            {
-                _snapshot = fresh;
-            }
-            else
-            {
-                _snapshot = MergeSnapshots(_snapshot, fresh);
-            }
+            // 以最新枚举结果为准：设备/接收器一旦消失或不再上报，旧电量立即清除。
+            _snapshot = fresh;
 
             if (fresh.HasSupported)
             {
                 _lastSuccess = DateTime.Now;
-                _failedPolls = 0;
 
                 DeviceBattery cacheDevice = null;
                 for (int i = 0; i < fresh.Devices.Count; i++)
@@ -278,80 +265,8 @@ namespace BatteryTray
                     WriteSetting("LastCategory", _cachedCategory);
                 }
             }
-            else if (_snapshot.HasSupported)
-            {
-                _failedPolls++;
-                if (_failedPolls >= 2)
-                {
-                    for (int i = 0; i < _snapshot.Devices.Count; i++)
-                    {
-                        if (_snapshot.Devices[i].Supported)
-                            _snapshot.Devices[i].Stale = true;
-                    }
-                }
-            }
 
             UpdateDisplay();
-        }
-
-        private static BatterySnapshot MergeSnapshots(BatterySnapshot old, BatterySnapshot fresh)
-        {
-            BatterySnapshot merged = new BatterySnapshot();
-            for (int i = 0; i < fresh.Devices.Count; i++)
-                merged.Devices.Add(fresh.Devices[i]);
-
-            for (int i = 0; i < old.Devices.Count; i++)
-            {
-                DeviceBattery oldDevice = old.Devices[i];
-                if (!oldDevice.Supported || oldDevice.Category == DeviceCategory.Other) continue;
-
-                string prefix = KeyPrefix(oldDevice.Key);
-                bool receiverPresent = false;
-                bool sameCategoryRefreshed = false;
-                bool sameCategoryPresent = false;
-                bool cacheEntry = oldDevice.Key == "cache";
-                for (int j = 0; j < fresh.Devices.Count; j++)
-                {
-                    DeviceBattery freshDevice = fresh.Devices[j];
-                    if (freshDevice.Category == oldDevice.Category)
-                        sameCategoryPresent = true;
-
-                    if (cacheEntry)
-                    {
-                        if (freshDevice.Category == oldDevice.Category)
-                            receiverPresent = true;
-                    }
-                    else if (freshDevice.Key.StartsWith(prefix, StringComparison.Ordinal))
-                    {
-                        receiverPresent = true;
-                    }
-                    if (freshDevice.Category == oldDevice.Category && freshDevice.Supported &&
-                        freshDevice.Percent >= 0)
-                        sameCategoryRefreshed = true;
-                }
-
-                if (!receiverPresent || !sameCategoryPresent || sameCategoryRefreshed) continue;
-                oldDevice.Stale = true;
-                merged.Devices.Add(oldDevice);
-            }
-            return merged;
-        }
-
-        private static string KeyPrefix(string key)
-        {
-            if (string.IsNullOrEmpty(key)) return "";
-            if (key == "cache" || key == "none") return key;
-            if (key.StartsWith("bth:", StringComparison.Ordinal))
-            {
-                int last = key.LastIndexOf(':');
-                return last > 4 ? key.Substring(0, last + 1) : "bth:";
-            }
-            if (key.StartsWith("xinput:", StringComparison.Ordinal)) return "xinput:";
-
-            int first = key.IndexOf(':');
-            if (first < 0) return key;
-            int second = key.IndexOf(':', first + 1);
-            return second >= 0 ? key.Substring(0, second + 1) : key.Substring(0, first + 1);
         }
 
         private void UpdateDisplay()
@@ -561,6 +476,7 @@ namespace BatteryTray
     internal sealed class DeviceChangeWindow : NativeWindow
     {
         private const int WM_DEVICECHANGE = 0x0219;
+        private IntPtr _notification;
 
         public event EventHandler DeviceChanged;
 
@@ -569,6 +485,12 @@ namespace BatteryTray
             CreateParams cp = new CreateParams();
             cp.Caption = "BatteryTrayDeviceChange";
             CreateHandle(cp);
+
+            Native.DEV_BROADCAST_DEVICEINTERFACE filter = new Native.DEV_BROADCAST_DEVICEINTERFACE();
+            filter.dbcc_size = Marshal.SizeOf(typeof(Native.DEV_BROADCAST_DEVICEINTERFACE));
+            filter.dbcc_devicetype = Native.DBT_DEVTYP_DEVICEINTERFACE;
+            filter.dbcc_classguid = Native.HidInterfaceGuid;
+            _notification = Native.RegisterDeviceNotification(Handle, ref filter, Native.DEVICE_NOTIFY_WINDOW_HANDLE);
         }
 
         protected override void WndProc(ref Message m)
@@ -579,6 +501,16 @@ namespace BatteryTray
                 if (handler != null) handler(this, EventArgs.Empty);
             }
             base.WndProc(ref m);
+        }
+
+        public override void DestroyHandle()
+        {
+            if (_notification != IntPtr.Zero)
+            {
+                Native.UnregisterDeviceNotification(_notification);
+                _notification = IntPtr.Zero;
+            }
+            base.DestroyHandle();
         }
     }
 
