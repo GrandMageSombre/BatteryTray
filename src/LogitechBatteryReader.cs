@@ -2,18 +2,39 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 namespace BatteryTray
 {
+    internal enum DeviceCategory
+    {
+        Gamepad = 0,
+        Mouse = 1,
+        Keyboard = 2,
+        Headset = 3,
+        Other = 4
+    }
+
+    internal enum DeviceConnection
+    {
+        UsbReceiver = 0,
+        Bluetooth = 1,
+        UsbWired = 2,
+        Unknown = 3
+    }
+
     internal sealed class DeviceBattery
     {
         public string Key;
         public string Label;
+        public string ShortLabel;
         public int Percent = -1;
         public bool Supported;
         public bool Stale;
         public string Detail = "";
+        public DeviceCategory Category = DeviceCategory.Other;
+        public DeviceConnection Connection = DeviceConnection.Unknown;
     }
 
     internal sealed class BatterySnapshot
@@ -48,17 +69,18 @@ namespace BatteryTray
     internal sealed class HidInterfaceInfo
     {
         public string Path;
+        public string Product;
         public ushort Vid;
         public ushort Pid;
         public ushort UsagePage;
+        public ushort Usage;
         public int InputReportLength;
         public int OutputReportLength;
+        public int FeatureReportLength;
     }
 
     internal static class BatteryReader
     {
-        private const ushort LogitechVid = 0x046D;
-        private const ushort SonixVid = 0x26CE;
         private const ushort BatteryStatusFeature = 0x1000;
         private const ushort UnifiedBatteryFeature = 0x1004;
         private const byte SoftwareId = 0x0C;
@@ -67,8 +89,34 @@ namespace BatteryTray
         {
             BatterySnapshot snapshot = new BatterySnapshot();
             List<HidInterfaceInfo> interfaces = EnumerateHidInterfaces();
-            Dictionary<string, List<HidInterfaceInfo>> receivers = new Dictionary<string, List<HidInterfaceInfo>>();
 
+            IBatteryProvider[] providers = new IBatteryProvider[]
+            {
+                new LogitechBatteryProvider(),
+                new GenericHidBatteryProvider(),
+                new DevicePresenceProvider(),
+                new BluetoothDeviceProvider(),
+                new XInputGamepadProvider()
+            };
+            for (int i = 0; i < providers.Length; i++)
+            {
+                try
+                {
+                    providers[i].Read(interfaces, snapshot);
+                }
+                catch
+                {
+                    // 单个厂商读取失败不应影响其他品牌
+                }
+            }
+
+            AddUnsupportedReceivers(interfaces, snapshot);
+            return snapshot;
+        }
+
+        internal static Dictionary<string, List<HidInterfaceInfo>> GroupReceivers(List<HidInterfaceInfo> interfaces)
+        {
+            Dictionary<string, List<HidInterfaceInfo>> receivers = new Dictionary<string, List<HidInterfaceInfo>>();
             for (int i = 0; i < interfaces.Count; i++)
             {
                 HidInterfaceInfo info = interfaces[i];
@@ -82,46 +130,86 @@ namespace BatteryTray
                 }
                 group.Add(info);
             }
-
-            bool anyReceiver = false;
-            foreach (KeyValuePair<string, List<HidInterfaceInfo>> pair in receivers)
-            {
-                ushort vid = pair.Value[0].Vid;
-                if (vid == LogitechVid)
-                {
-                    anyReceiver = true;
-                    ReadLogitechReceiver(pair.Key, pair.Value, snapshot);
-                }
-                else if (vid == SonixVid)
-                {
-                    anyReceiver = true;
-                    snapshot.Devices.Add(new DeviceBattery
-                    {
-                        Key = "sonix:" + pair.Key,
-                        Label = "SONiX 2.4G 接收器",
-                        Supported = false,
-                        Percent = -1,
-                        Detail = "该接收器未提供标准 HID 电量特性，无法读取"
-                    });
-                }
-            }
-
-            if (!anyReceiver)
-            {
-                snapshot.Devices.Add(new DeviceBattery
-                {
-                    Key = "none",
-                    Label = "2.4G 接收器",
-                    Supported = false,
-                    Percent = -1,
-                    Detail = "未检测到 2.4G 接收器"
-                });
-            }
-
-            return snapshot;
+            return receivers;
         }
 
-        private static void ReadLogitechReceiver(string receiverKey, List<HidInterfaceInfo> interfaces, BatterySnapshot snapshot)
+        private static void AddUnsupportedReceivers(List<HidInterfaceInfo> interfaces, BatterySnapshot snapshot)
+        {
+            Dictionary<string, List<HidInterfaceInfo>> receivers = GroupReceivers(interfaces);
+            if (receivers.Count == 0)
+            {
+                if (snapshot.Devices.Count == 0)
+                {
+                    snapshot.Devices.Add(new DeviceBattery
+                    {
+                        Key = "none",
+                        Label = "2.4G 接收器",
+                        ShortLabel = "2.4G",
+                        Supported = false,
+                        Percent = -1,
+                        Detail = "未检测到 2.4G 接收器"
+                    });
+                }
+                return;
+            }
+
+            foreach (KeyValuePair<string, List<HidInterfaceInfo>> pair in receivers)
+            {
+                if (DeviceClassifier.ClassifyConnection(pair.Value[0], pair.Value) != DeviceConnection.UsbReceiver)
+                    continue;
+
+                bool hasSupported = false;
+                string prefix = pair.Key + ":";
+                for (int i = 0; i < snapshot.Devices.Count; i++)
+                {
+                    if (snapshot.Devices[i].Supported &&
+                        snapshot.Devices[i].Key.StartsWith(prefix, StringComparison.Ordinal))
+                    {
+                        hasSupported = true;
+                        break;
+                    }
+                }
+                if (!hasSupported)
+                    snapshot.Devices.Add(CreateUnsupportedReceiver(pair.Key, pair.Value[0]));
+            }
+        }
+
+        private static DeviceBattery CreateUnsupportedReceiver(string key, HidInterfaceInfo info)
+        {
+            string vendor = VendorCatalog.GetVendorName(info.Vid);
+            string label;
+            string detail;
+            if (info.Vid == 0x26CE)
+            {
+                label = "SONiX 2.4G 接收器";
+                detail = "接收器芯片为 SONiX（松翰），未提供标准 HID 电池字段";
+            }
+            else if (info.Vid == 0x046D)
+            {
+                label = "罗技 2.4G 接收器";
+                detail = "未发现可读取电量的设备（设备可能处于休眠或未配对）";
+            }
+            else
+            {
+                label = (vendor != null ? vendor : "未知品牌") + " 2.4G 接收器";
+                detail = "未提供可读的标准 HID 电池字段";
+                if (!string.IsNullOrEmpty(info.Product))
+                    detail += "（" + info.Product + "）";
+            }
+
+            return new DeviceBattery
+            {
+                Key = key + ":receiver",
+                Label = label,
+                ShortLabel = (vendor != null ? vendor : "2.4G") + "接收器",
+                Supported = false,
+                Percent = -1,
+                Detail = detail,
+                Connection = DeviceConnection.UsbReceiver
+            };
+        }
+
+        internal static void ReadLogitechReceiver(string receiverKey, List<HidInterfaceInfo> interfaces, BatterySnapshot snapshot)
         {
             List<HidInterfaceInfo> candidates = new List<HidInterfaceInfo>();
             for (int i = 0; i < interfaces.Count; i++)
@@ -141,7 +229,7 @@ namespace BatteryTray
                 {
                     if (connection == null) continue;
                     byte reportId = connection.OutputReportLength >= 20 ? (byte)0x11 : (byte)0x10;
-                    List<DeviceBattery> found = ReadLogitechDevices(connection, reportId, receiverKey);
+                    List<DeviceBattery> found = ReadLogitechDevices(connection, reportId, receiverKey, interfaces);
                     if (found.Count > 0)
                     {
                         snapshot.Devices.AddRange(found);
@@ -149,42 +237,57 @@ namespace BatteryTray
                     }
                 }
             }
-
-            snapshot.Devices.Add(new DeviceBattery
-            {
-                Key = receiverKey + ":receiver",
-                Label = "罗技 2.4G 接收器",
-                Supported = false,
-                Percent = -1,
-                Detail = "未发现可读取电量的设备（设备可能处于休眠或未配对）"
-            });
         }
 
-        private static List<DeviceBattery> ReadLogitechDevices(HidConnection connection, byte reportId, string receiverKey)
+        private static List<DeviceBattery> ReadLogitechDevices(HidConnection connection, byte reportId, string receiverKey, List<HidInterfaceInfo> group)
         {
             List<DeviceBattery> result = new List<DeviceBattery>();
             for (int index = 1; index <= 6; index++)
             {
                 ushort feature = BatteryStatusFeature;
-                int featureIndex = connection.GetFeature(index, feature, reportId, 3, 350);
-                if (featureIndex <= 0)
+                int attempts = index <= 2 ? 2 : 1;
+                int timeout = index <= 2 ? 450 : 250;
+                int featureIndex = connection.GetFeature(index, feature, reportId, attempts, timeout);
+                if (featureIndex == 0)
                 {
                     feature = UnifiedBatteryFeature;
-                    featureIndex = connection.GetFeature(index, feature, reportId, 3, 350);
+                    featureIndex = connection.GetFeature(index, feature, reportId, attempts, timeout);
                 }
                 if (featureIndex <= 0) continue;
 
-                byte[] response = connection.Call(index, featureIndex, 0, reportId, null, 2, 350);
+                byte[] response;
+                if (feature == UnifiedBatteryFeature)
+                {
+                    byte[] capabilities = connection.Call(index, featureIndex, 0, reportId, null, 1, 300);
+                    if (capabilities == null || HidConnection.IsErrorResponse(capabilities)) continue;
+                    if ((capabilities[5] & 0x02) == 0) continue;
+                    response = connection.Call(index, featureIndex, 1, reportId, null, 2, 450);
+                }
+                else
+                {
+                    response = connection.Call(index, featureIndex, 0, reportId, null, 2, 450);
+                }
                 if (response == null || HidConnection.IsErrorResponse(response)) continue;
 
                 int percent = response[4];
                 if (feature == BatteryStatusFeature && percent == 0) percent = -1;
                 else if (percent > 100) percent = 100;
 
+                DeviceCategory category = GetLogitechCategory(connection, index, reportId, group);
+                string categoryName = DeviceClassifier.CategoryName(category);
+                bool fitsCategory = category != DeviceCategory.Other;
+
                 DeviceBattery device = new DeviceBattery
                 {
                     Key = receiverKey + ":" + index.ToString(CultureInfo.InvariantCulture),
-                    Label = "罗技 2.4G 设备 " + index.ToString(CultureInfo.InvariantCulture),
+                    Label = fitsCategory
+                        ? "罗技 " + categoryName
+                        : "罗技 2.4G 设备 " + index.ToString(CultureInfo.InvariantCulture),
+                    ShortLabel = fitsCategory
+                        ? "罗技" + categoryName
+                        : "罗技设备 " + index.ToString(CultureInfo.InvariantCulture),
+                    Category = category,
+                    Connection = DeviceConnection.UsbReceiver,
                     Supported = true,
                     Percent = percent,
                     Detail = feature == BatteryStatusFeature
@@ -194,6 +297,80 @@ namespace BatteryTray
                 result.Add(device);
             }
             return result;
+        }
+
+        private static DeviceCategory GetLogitechCategory(HidConnection connection, int index, byte reportId, List<HidInterfaceInfo> group)
+        {
+            int featureIndex = connection.GetFeature(index, 0x0005, reportId, 1, 300);
+            if (featureIndex > 0)
+            {
+                byte[] typeResponse = connection.Call(index, featureIndex, 2, reportId, null, 1, 300);
+                if (typeResponse != null && !HidConnection.IsErrorResponse(typeResponse))
+                {
+                    switch (typeResponse[4])
+                    {
+                        case 0:
+                        case 2:
+                            return DeviceCategory.Keyboard;
+                        case 3:
+                        case 4:
+                        case 5:
+                            return DeviceCategory.Mouse;
+                    }
+                }
+
+                string name = ReadLogitechName(connection, index, featureIndex, reportId);
+                DeviceCategory byName = DeviceClassifier.FromProductName(name);
+                if (byName != DeviceCategory.Other) return byName;
+            }
+
+            return InferCategoryFromGroup(group);
+        }
+
+        private static string ReadLogitechName(HidConnection connection, int index, int featureIndex, byte reportId)
+        {
+            byte[] lengthResponse = connection.Call(index, featureIndex, 0, reportId, null, 1, 300);
+            if (lengthResponse == null || HidConnection.IsErrorResponse(lengthResponse)) return "";
+
+            int length = lengthResponse[4];
+            StringBuilder name = new StringBuilder();
+            for (int offset = 0; offset < length; offset += 16)
+            {
+                byte[] chunk = connection.Call(index, featureIndex, 1, reportId, new byte[] { (byte)offset }, 1, 300);
+                if (chunk == null || HidConnection.IsErrorResponse(chunk)) break;
+                int end = Math.Min(chunk.Length, 20);
+                for (int i = 4; i < end; i++)
+                {
+                    byte value = chunk[i];
+                    if (value == 0) return name.ToString();
+                    if (value >= 32 && value < 127) name.Append((char)value);
+                }
+            }
+            return name.ToString();
+        }
+
+        private static DeviceCategory InferCategoryFromGroup(List<HidInterfaceInfo> group)
+        {
+            bool keyboard = false;
+            bool mouse = false;
+            bool gamepad = false;
+            bool headset = false;
+            for (int i = 0; i < group.Count; i++)
+            {
+                DeviceCategory category = DeviceClassifier.FromHidUsage(group[i].UsagePage, group[i].Usage);
+                if (category == DeviceCategory.Other && !string.IsNullOrEmpty(group[i].Product))
+                    category = DeviceClassifier.FromProductName(group[i].Product);
+                if (category == DeviceCategory.Keyboard) keyboard = true;
+                else if (category == DeviceCategory.Mouse) mouse = true;
+                else if (category == DeviceCategory.Gamepad) gamepad = true;
+                else if (category == DeviceCategory.Headset) headset = true;
+            }
+
+            if (gamepad) return DeviceCategory.Gamepad;
+            if (headset) return DeviceCategory.Headset;
+            if (keyboard && !mouse) return DeviceCategory.Keyboard;
+            if (mouse && !keyboard) return DeviceCategory.Mouse;
+            return DeviceCategory.Other;
         }
 
         private static List<HidInterfaceInfo> EnumerateHidInterfaces()
@@ -224,8 +401,14 @@ namespace BatteryTray
                         {
                             Native.HIDP_CAPS caps = GetCaps(handle);
                             info.UsagePage = caps.UsagePage;
+                            info.Usage = caps.Usage;
                             info.InputReportLength = caps.InputReportByteLength;
                             info.OutputReportLength = caps.OutputReportByteLength;
+                            info.FeatureReportLength = caps.FeatureReportByteLength;
+
+                            StringBuilder product = new StringBuilder(256);
+                            if (Native.HidD_GetProductString(handle, product, 512))
+                                info.Product = product.ToString().Trim();
                         }
                         finally
                         {
@@ -378,8 +561,7 @@ namespace BatteryTray
                 {
                     NativeOverlapped writeOverlapped = new NativeOverlapped();
                     writeOverlapped.EventHandle = eventHandle;
-                    int written;
-                    bool ok = Native.WriteFile(_handle, requestPin.AddrOfPinnedObject(), request.Length, out written, ref writeOverlapped);
+                    bool ok = Native.WriteFile(_handle, requestPin.AddrOfPinnedObject(), request.Length, IntPtr.Zero, ref writeOverlapped);
                     if (!ok)
                     {
                         int error = Marshal.GetLastWin32Error();
@@ -404,7 +586,7 @@ namespace BatteryTray
                             NativeOverlapped readOverlapped = new NativeOverlapped();
                             readOverlapped.EventHandle = eventHandle;
                             int readCount;
-                            ok = Native.ReadFile(_handle, readBuffer, bufferLength, out readCount, ref readOverlapped);
+                            ok = Native.ReadFile(_handle, readBuffer, bufferLength, IntPtr.Zero, ref readOverlapped);
                             if (!ok)
                             {
                                 int error = Marshal.GetLastWin32Error();
@@ -464,6 +646,24 @@ namespace BatteryTray
                     Native.CloseHandle(_handle);
                     _handle = IntPtr.Zero;
                 }
+            }
+        }
+    }
+
+    internal sealed class LogitechBatteryProvider : IBatteryProvider
+    {
+        public string Name
+        {
+            get { return "罗技 HID++ 2.0"; }
+        }
+
+        public void Read(List<HidInterfaceInfo> interfaces, BatterySnapshot snapshot)
+        {
+            Dictionary<string, List<HidInterfaceInfo>> receivers = BatteryReader.GroupReceivers(interfaces);
+            foreach (KeyValuePair<string, List<HidInterfaceInfo>> pair in receivers)
+            {
+                if (pair.Value[0].Vid != 0x046D) continue;
+                BatteryReader.ReadLogitechReceiver(pair.Key, pair.Value, snapshot);
             }
         }
     }

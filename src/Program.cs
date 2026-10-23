@@ -50,43 +50,46 @@ namespace BatteryTray
         private readonly SynchronizationContext _ui;
         private readonly NotifyIcon _notify;
         private readonly ContextMenuStrip _menu;
-        private ToolStripMenuItem _barItem;
+        private ToolStripMenuItem _panelItem;
         private ToolStripMenuItem _autoStartItem;
-        private readonly ClockBarForm _bar;
+        private readonly DevicePanelForm _panel;
         private readonly System.Windows.Forms.Timer _timer;
         private BatterySnapshot _snapshot;
         private DateTime _lastSuccess = DateTime.MinValue;
         private Icon _trayIcon;
         private int _lastIconPercent = int.MinValue;
-        private bool _showBar;
+        private bool _lastIconHasBattery;
+        private bool _showPanel;
         private bool _exiting;
         private bool _suppressAutoStartEvent;
         private int _polling;
         private int _failedPolls;
         private int _cachedPercent;
+        private int _cachedCategory;
 
         public TrayContext()
         {
             _ui = SynchronizationContext.Current;
             if (_ui == null) _ui = new WindowsFormsSynchronizationContext();
 
-            _showBar = ReadSetting("ShowBar", 1) == 1;
+            _showPanel = ReadSetting("ShowBar", 1) == 1;
             _cachedPercent = ReadSetting("LastPercent", -1);
+            _cachedCategory = ReadSetting("LastCategory", -1);
             bool firstRun = !SettingExists("AutoStart");
             bool autoStart = firstRun || AutoStart.IsEnabled();
 
-            _bar = new ClockBarForm();
+            _panel = new DevicePanelForm();
             _menu = BuildMenu(autoStart);
 
-            _trayIcon = TrayIconFactory.Create(-1);
+            _trayIcon = TrayIconFactory.Create(-1, false);
             _notify = new NotifyIcon();
             _notify.Icon = _trayIcon;
-            _notify.Text = "2.4G 电量";
+            _notify.Text = "设备电量";
             _notify.ContextMenuStrip = _menu;
             _notify.DoubleClick += delegate { ShowStatus(); };
             _notify.Visible = true;
 
-            _bar.BarEnabled = _showBar;
+            _panel.PanelEnabled = _showPanel;
 
             if (firstRun)
             {
@@ -98,13 +101,17 @@ namespace BatteryTray
                 AutoStart.Set(true);
             }
 
-            if (_cachedPercent >= 0)
+            if (_cachedPercent >= 0 && _cachedCategory >= 0 && _cachedCategory <= (int)DeviceCategory.Headset)
             {
+                DeviceCategory category = (DeviceCategory)_cachedCategory;
                 _snapshot = new BatterySnapshot();
                 _snapshot.Devices.Add(new DeviceBattery
                 {
                     Key = "cache",
-                    Label = "上次读取",
+                    Label = DeviceClassifier.CategoryName(category) + "（上次读取）",
+                    ShortLabel = DeviceClassifier.CategoryName(category),
+                    Category = category,
+                    Connection = DeviceConnection.Unknown,
                     Supported = true,
                     Percent = _cachedPercent,
                     Stale = true,
@@ -130,11 +137,11 @@ namespace BatteryTray
             menu.Items.Add(refresh);
             menu.Items.Add(new ToolStripSeparator());
 
-            _barItem = new ToolStripMenuItem("显示在时间栏旁");
-            _barItem.CheckOnClick = true;
-            _barItem.Checked = _showBar;
-            _barItem.CheckedChanged += BarItemCheckedChanged;
-            menu.Items.Add(_barItem);
+            _panelItem = new ToolStripMenuItem("显示在时间栏上方");
+            _panelItem.CheckOnClick = true;
+            _panelItem.Checked = _showPanel;
+            _panelItem.CheckedChanged += PanelItemCheckedChanged;
+            menu.Items.Add(_panelItem);
 
             _autoStartItem = new ToolStripMenuItem("开机自启");
             _autoStartItem.CheckOnClick = true;
@@ -154,11 +161,11 @@ namespace BatteryTray
             return menu;
         }
 
-        private void BarItemCheckedChanged(object sender, EventArgs e)
+        private void PanelItemCheckedChanged(object sender, EventArgs e)
         {
-            _showBar = _barItem.Checked;
-            WriteSetting("ShowBar", _showBar ? 1 : 0);
-            _bar.BarEnabled = _showBar;
+            _showPanel = _panelItem.Checked;
+            WriteSetting("ShowBar", _showPanel ? 1 : 0);
+            _panel.PanelEnabled = _showPanel;
         }
 
         private void AutoStartItemCheckedChanged(object sender, EventArgs e)
@@ -226,25 +233,40 @@ namespace BatteryTray
                 if (fresh.Devices[i].Key == "none") receiverAbsent = true;
             }
 
-            if (fresh.HasSupported)
+            if (_snapshot == null || receiverAbsent)
             {
                 _snapshot = fresh;
+            }
+            else
+            {
+                _snapshot = MergeSnapshots(_snapshot, fresh);
+            }
+
+            if (fresh.HasSupported)
+            {
                 _lastSuccess = DateTime.Now;
                 _failedPolls = 0;
 
-                DeviceBattery primary = fresh.Primary;
-                if (primary != null && primary.Percent >= 0 && primary.Percent != _cachedPercent)
+                DeviceBattery cacheDevice = null;
+                for (int i = 0; i < fresh.Devices.Count; i++)
                 {
-                    _cachedPercent = primary.Percent;
+                    DeviceBattery candidate = fresh.Devices[i];
+                    if (candidate.Supported && candidate.Percent >= 0 && candidate.Category != DeviceCategory.Other)
+                    {
+                        cacheDevice = candidate;
+                        break;
+                    }
+                }
+                if (cacheDevice != null &&
+                    (cacheDevice.Percent != _cachedPercent || (int)cacheDevice.Category != _cachedCategory))
+                {
+                    _cachedPercent = cacheDevice.Percent;
+                    _cachedCategory = (int)cacheDevice.Category;
                     WriteSetting("LastPercent", _cachedPercent);
+                    WriteSetting("LastCategory", _cachedCategory);
                 }
             }
-            else if (receiverAbsent)
-            {
-                _snapshot = fresh;
-                _failedPolls = 0;
-            }
-            else if (_snapshot != null && _snapshot.HasSupported)
+            else if (_snapshot.HasSupported)
             {
                 _failedPolls++;
                 if (_failedPolls >= 2)
@@ -256,102 +278,129 @@ namespace BatteryTray
                     }
                 }
             }
-            else
-            {
-                _snapshot = fresh;
-            }
 
             UpdateDisplay();
         }
 
+        private static BatterySnapshot MergeSnapshots(BatterySnapshot old, BatterySnapshot fresh)
+        {
+            BatterySnapshot merged = new BatterySnapshot();
+            for (int i = 0; i < fresh.Devices.Count; i++)
+                merged.Devices.Add(fresh.Devices[i]);
+
+            for (int i = 0; i < old.Devices.Count; i++)
+            {
+                DeviceBattery oldDevice = old.Devices[i];
+                if (!oldDevice.Supported || oldDevice.Category == DeviceCategory.Other) continue;
+
+                string prefix = KeyPrefix(oldDevice.Key);
+                bool receiverPresent = false;
+                bool sameCategoryRefreshed = false;
+                bool cacheEntry = oldDevice.Key == "cache";
+                for (int j = 0; j < fresh.Devices.Count; j++)
+                {
+                    DeviceBattery freshDevice = fresh.Devices[j];
+                    if (cacheEntry)
+                    {
+                        if (freshDevice.Category == oldDevice.Category)
+                            receiverPresent = true;
+                    }
+                    else if (freshDevice.Key.StartsWith(prefix, StringComparison.Ordinal))
+                    {
+                        receiverPresent = true;
+                    }
+                    if (freshDevice.Category == oldDevice.Category && freshDevice.Supported)
+                        sameCategoryRefreshed = true;
+                }
+
+                if (!receiverPresent || sameCategoryRefreshed) continue;
+                oldDevice.Stale = true;
+                merged.Devices.Add(oldDevice);
+            }
+            return merged;
+        }
+
+        private static string KeyPrefix(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return "";
+            if (key == "cache" || key == "none") return key;
+            if (key.StartsWith("bth:", StringComparison.Ordinal))
+            {
+                int last = key.LastIndexOf(':');
+                return last > 4 ? key.Substring(0, last + 1) : "bth:";
+            }
+            if (key.StartsWith("xinput:", StringComparison.Ordinal)) return "xinput:";
+
+            int first = key.IndexOf(':');
+            if (first < 0) return key;
+            int second = key.IndexOf(':', first + 1);
+            return second >= 0 ? key.Substring(0, second + 1) : key.Substring(0, first + 1);
+        }
+
         private void UpdateDisplay()
         {
-            DeviceBattery primary = _snapshot != null ? _snapshot.Primary : null;
-            int percent = primary != null ? primary.Percent : -1;
-            bool stale = primary != null && primary.Stale;
-
-            UpdateTrayIcon(percent);
-            UpdateTooltip(primary, stale);
-
-            string barText = BuildBarText();
-            _bar.SetStatus(barText, percent, percent < 0);
-        }
-
-        private string BuildBarText()
-        {
-            List<DeviceBattery> supported = SupportedDevices();
-            if (supported.Count == 0) return "2.4G --";
-
-            StringBuilder builder = new StringBuilder("2.4G ");
-            for (int i = 0; i < supported.Count; i++)
-            {
-                if (i > 0) builder.Append(" / ");
-                if (supported[i].Percent >= 0)
-                    builder.Append(supported[i].Percent.ToString(CultureInfo.InvariantCulture)).Append('%');
-                else
-                    builder.Append("--");
-            }
-            return builder.ToString();
-        }
-
-        private List<DeviceBattery> SupportedDevices()
-        {
-            List<DeviceBattery> list = new List<DeviceBattery>();
-            if (_snapshot == null) return list;
-            for (int i = 0; i < _snapshot.Devices.Count; i++)
-            {
-                if (_snapshot.Devices[i].Supported) list.Add(_snapshot.Devices[i]);
-            }
-            return list;
-        }
-
-        private void UpdateTrayIcon(int percent)
-        {
-            if (_lastIconPercent == percent) return;
-
-            _lastIconPercent = percent;
-            Icon old = _trayIcon;
-            _trayIcon = TrayIconFactory.Create(percent);
-            _notify.Icon = _trayIcon;
-            if (old != null) old.Dispose();
-        }
-
-        private void UpdateTooltip(DeviceBattery primary, bool stale)
-        {
-            StringBuilder builder = new StringBuilder();
-            if (primary != null && primary.Percent >= 0)
-                builder.Append("2.4G ").Append(primary.Percent.ToString(CultureInfo.InvariantCulture)).Append('%');
-            else
-                builder.Append("2.4G 电量未知");
-            if (stale) builder.Append("（上次读取）");
-
-            List<string> parts = new List<string>();
-            List<DeviceBattery> supported = SupportedDevices();
-            for (int i = 0; i < supported.Count; i++)
-            {
-                DeviceBattery device = supported[i];
-                if (device.Percent >= 0)
-                    parts.Add("罗技 " + device.Percent.ToString(CultureInfo.InvariantCulture) + "%");
-            }
+            int percent = -1;
+            bool hasBattery = false;
             if (_snapshot != null)
             {
                 for (int i = 0; i < _snapshot.Devices.Count; i++)
                 {
                     DeviceBattery device = _snapshot.Devices[i];
-                    if (!device.Supported && device.Label.StartsWith("SONiX", StringComparison.Ordinal))
-                        parts.Add("SONiX 不支持");
-                }
-            }
-            if (parts.Count > 0)
-            {
-                builder.Append(" · ");
-                for (int i = 0; i < parts.Count; i++)
-                {
-                    if (i > 0) builder.Append(" · ");
-                    builder.Append(parts[i]);
+                    if (!device.Supported || device.Percent < 0) continue;
+                    hasBattery = true;
+                    if (percent < 0 || device.Percent < percent) percent = device.Percent;
                 }
             }
 
+            UpdateTrayIcon(percent, hasBattery);
+            UpdateTooltip();
+            _panel.SetDevices(_snapshot != null ? _snapshot.Devices : new List<DeviceBattery>());
+        }
+
+        private void UpdateTrayIcon(int percent, bool hasBattery)
+        {
+            if (_lastIconPercent == percent && _lastIconHasBattery == hasBattery) return;
+
+            _lastIconPercent = percent;
+            _lastIconHasBattery = hasBattery;
+            Icon old = _trayIcon;
+            _trayIcon = TrayIconFactory.Create(percent, hasBattery);
+            _notify.Icon = _trayIcon;
+            if (old != null) old.Dispose();
+        }
+
+        private void UpdateTooltip()
+        {
+            DeviceCategory[] categories = new DeviceCategory[]
+            {
+                DeviceCategory.Gamepad,
+                DeviceCategory.Mouse,
+                DeviceCategory.Keyboard,
+                DeviceCategory.Headset
+            };
+
+            StringBuilder builder = new StringBuilder();
+            bool first = true;
+            for (int i = 0; i < categories.Length; i++)
+            {
+                DeviceBattery device = DeviceClassifier.BestForCategory(
+                    _snapshot != null ? _snapshot.Devices : null, categories[i]);
+                if (device == null) continue;
+
+                if (!first) builder.Append(" · ");
+                builder.Append(DeviceClassifier.CategoryName(categories[i]));
+                if (device.Supported && device.Percent >= 0)
+                    builder.Append(' ').Append(device.Percent.ToString(CultureInfo.InvariantCulture)).Append('%');
+                else if (device.Connection == DeviceConnection.Bluetooth)
+                    builder.Append(" 蓝牙");
+                else if (device.Connection == DeviceConnection.UsbWired)
+                    builder.Append(" 有线");
+                else
+                    builder.Append(" 无电量");
+                first = false;
+            }
+
+            if (builder.Length == 0) builder.Append("设备电量未知");
             string text = builder.ToString();
             if (text.Length > 63) text = text.Substring(0, 60) + "...";
             _notify.Text = text;
@@ -360,7 +409,7 @@ namespace BatteryTray
         private void ShowStatus()
         {
             StringBuilder builder = new StringBuilder();
-            builder.AppendLine("2.4G 设备电量");
+            builder.AppendLine("设备电量");
             builder.AppendLine("刷新间隔：10 秒");
             if (_lastSuccess != DateTime.MinValue)
                 builder.AppendLine("最近成功读取：" + _lastSuccess.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
@@ -372,28 +421,53 @@ namespace BatteryTray
             }
             else
             {
-                for (int i = 0; i < _snapshot.Devices.Count; i++)
+                DeviceCategory[] categories = new DeviceCategory[]
                 {
-                    DeviceBattery device = _snapshot.Devices[i];
-                    if (device.Supported)
+                    DeviceCategory.Gamepad,
+                    DeviceCategory.Mouse,
+                    DeviceCategory.Keyboard,
+                    DeviceCategory.Headset
+                };
+
+                for (int i = 0; i < categories.Length; i++)
+                {
+                    for (int j = 0; j < _snapshot.Devices.Count; j++)
                     {
-                        builder.Append("· ").Append(device.Label).Append("：");
-                        builder.Append(device.Percent >= 0 ? device.Percent.ToString(CultureInfo.InvariantCulture) + "%" : "未知");
+                        DeviceBattery device = _snapshot.Devices[j];
+                        if (device.Category != categories[i]) continue;
+
+                        builder.Append("· ").Append(DeviceClassifier.CategoryName(categories[i]))
+                            .Append("：").Append(device.Label)
+                            .Append("（").Append(DeviceClassifier.ConnectionName(device.Connection)).Append("）");
+                        if (device.Supported && device.Percent >= 0)
+                            builder.Append(" ").Append(device.Percent.ToString(CultureInfo.InvariantCulture)).Append('%');
+                        else
+                            builder.Append(" 无可读电量");
                         if (device.Stale) builder.Append("（本次读取超时，显示上次值）");
                         builder.AppendLine();
                         if (!string.IsNullOrEmpty(device.Detail))
                             builder.AppendLine("  " + device.Detail);
                     }
-                    else
+                }
+
+                bool otherHeader = false;
+                for (int i = 0; i < _snapshot.Devices.Count; i++)
+                {
+                    DeviceBattery device = _snapshot.Devices[i];
+                    if (device.Category != DeviceCategory.Other) continue;
+                    if (!otherHeader)
                     {
-                        builder.Append("· ").Append(device.Label).Append("：").Append(device.Detail).AppendLine();
+                        builder.AppendLine();
+                        builder.AppendLine("接收器/其他：");
+                        otherHeader = true;
                     }
+                    builder.Append("· ").Append(device.Label).Append("：").Append(device.Detail).AppendLine();
                 }
             }
 
             builder.AppendLine();
-            builder.AppendLine("说明：罗技设备通过 HID++ 2.0 电池状态特性读取；未提供标准电量特性的接收器无法读取。");
-            MessageBox.Show(builder.ToString(), "2.4G 设备状态", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            builder.AppendLine("说明：支持标准 HID 电池字段、罗技 HID++ 2.0 和已识别的蓝牙设备；私有协议需按品牌单独适配。");
+            MessageBox.Show(builder.ToString(), "设备状态", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
         private static int ReadSetting(string name, int defaultValue)
@@ -459,8 +533,8 @@ namespace BatteryTray
                 _trayIcon = null;
             }
 
-            _bar.Close();
-            _bar.Dispose();
+            _panel.Close();
+            _panel.Dispose();
             _menu.Dispose();
             base.ExitThreadCore();
         }
@@ -509,33 +583,40 @@ namespace BatteryTray
 
     internal static class TrayIconFactory
     {
-        public static Icon Create(int percent)
+        public static Icon Create(int percent, bool hasBattery)
         {
             using (Bitmap bitmap = new Bitmap(32, 32))
             {
                 using (Graphics graphics = Graphics.FromImage(bitmap))
                 {
                     graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                    graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
                     graphics.Clear(Color.Transparent);
 
-                    Color background;
-                    if (percent < 0) background = Color.FromArgb(105, 105, 105);
-                    else if (percent <= 20) background = Color.FromArgb(214, 69, 69);
-                    else if (percent <= 60) background = Color.FromArgb(217, 146, 45);
-                    else background = Color.FromArgb(46, 160, 96);
+                    Color outline = IsLightTheme()
+                        ? Color.FromArgb(155, 45, 45, 45)
+                        : Color.FromArgb(190, 245, 245, 245);
 
-                    using (GraphicsPath path = RoundedRect(new Rectangle(1, 1, 30, 30), 8))
-                    using (SolidBrush brush = new SolidBrush(background))
-                        graphics.FillPath(brush, path);
-
-                    string text = percent >= 0 ? percent.ToString(CultureInfo.InvariantCulture) : "?";
-                    float fontSize = text.Length >= 3 ? 9.5f : 14f;
-                    using (Font font = new Font("Segoe UI", fontSize, FontStyle.Bold, GraphicsUnit.Pixel))
-                    using (SolidBrush textBrush = new SolidBrush(Color.White))
+                    using (Pen pen = new Pen(outline, 2f))
                     {
-                        SizeF measured = graphics.MeasureString(text, font);
-                        graphics.DrawString(text, font, textBrush, (32f - measured.Width) / 2f, (32f - measured.Height) / 2f);
+                        graphics.DrawRectangle(pen, 6, 9, 18, 14);
+                        using (SolidBrush nub = new SolidBrush(outline))
+                            graphics.FillRectangle(nub, 24, 13, 3, 6);
+                    }
+
+                    if (hasBattery && percent >= 0)
+                    {
+                        Color fill;
+                        if (percent <= 20) fill = Color.FromArgb(200, 214, 69, 69);
+                        else if (percent <= 60) fill = Color.FromArgb(200, 217, 146, 45);
+                        else fill = Color.FromArgb(200, 46, 160, 96);
+
+                        int width = (int)Math.Round(14 * (percent / 100.0));
+                        if (percent == 0) width = 2;
+                        if (width > 0)
+                        {
+                            using (SolidBrush brush = new SolidBrush(fill))
+                                graphics.FillRectangle(brush, 8, 11, width, 10);
+                        }
                     }
                 }
 
@@ -552,16 +633,23 @@ namespace BatteryTray
             }
         }
 
-        private static GraphicsPath RoundedRect(Rectangle bounds, int radius)
+        private static bool IsLightTheme()
         {
-            GraphicsPath path = new GraphicsPath();
-            int diameter = radius * 2;
-            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
-            path.CloseFigure();
-            return path;
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    if (key != null)
+                    {
+                        object value = key.GetValue("SystemUsesLightTheme");
+                        if (value != null) return Convert.ToInt32(value, CultureInfo.InvariantCulture) == 1;
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return false;
         }
     }
 }
