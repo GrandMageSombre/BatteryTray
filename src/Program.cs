@@ -325,7 +325,8 @@ namespace BatteryTray
                     {
                         receiverPresent = true;
                     }
-                    if (freshDevice.Category == oldDevice.Category && freshDevice.Supported)
+                    if (freshDevice.Category == oldDevice.Category && freshDevice.Supported &&
+                        freshDevice.Percent >= 0)
                         sameCategoryRefreshed = true;
                 }
 

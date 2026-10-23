@@ -19,10 +19,14 @@ namespace BatteryTray
         public const int WS_EX_TOOLWINDOW = 0x00000080;
         public const int WS_EX_TRANSPARENT = 0x00000020;
         public const int WS_EX_NOACTIVATE = 0x08000000;
+        public const int WS_EX_LAYERED = 0x00080000;
 
+        public const uint SWP_NOSIZE = 0x0001;
+        public const uint SWP_NOMOVE = 0x0002;
         public const uint SWP_NOACTIVATE = 0x0010;
         public const uint SWP_SHOWWINDOW = 0x0040;
         public const uint SWP_NOOWNERZORDER = 0x0200;
+        public const uint ULW_ALPHA = 0x00000002;
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
 
         public static readonly Guid HidInterfaceGuid = new Guid("4D1E55B2-F16F-11CF-88CB-001111000030");
@@ -89,6 +93,29 @@ namespace BatteryTray
             public int Bottom;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SIZE
+        {
+            public int CX;
+            public int CY;
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        public struct BLENDFUNCTION
+        {
+            public byte BlendOp;
+            public byte BlendFlags;
+            public byte SourceConstantAlpha;
+            public byte AlphaFormat;
+        }
+
         [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr SetupDiGetClassDevs(ref Guid classGuid, IntPtr enumerator, IntPtr parent, uint flags);
 
@@ -148,6 +175,31 @@ namespace BatteryTray
 
         [DllImport("user32.dll")]
         public static extern bool GetWindowRect(IntPtr window, out RECT rect);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsWindowVisible(IntPtr window);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UpdateLayeredWindow(IntPtr window, IntPtr destinationDc, ref POINT destination,
+            ref SIZE size, IntPtr sourceDc, ref POINT source, IntPtr colorKey, ref BLENDFUNCTION blend, uint flags);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetDC(IntPtr window);
+
+        [DllImport("user32.dll")]
+        public static extern int ReleaseDC(IntPtr window, IntPtr dc);
+
+        [DllImport("gdi32.dll")]
+        public static extern IntPtr CreateCompatibleDC(IntPtr dc);
+
+        [DllImport("gdi32.dll")]
+        public static extern bool DeleteDC(IntPtr dc);
+
+        [DllImport("gdi32.dll")]
+        public static extern IntPtr SelectObject(IntPtr dc, IntPtr gdiObject);
+
+        [DllImport("gdi32.dll")]
+        public static extern bool DeleteObject(IntPtr gdiObject);
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -16,10 +17,10 @@ namespace BatteryTray
 
         private readonly Timer _positionTimer;
         private readonly DeviceBattery[] _slots = new DeviceBattery[4];
+        private readonly Bitmap _surface;
         private bool _enabled = true;
-        private Color _background;
+        private bool _dirty = true;
         private Color _foreground;
-        private Color _border;
         private int _lastX = int.MinValue;
         private int _lastY = int.MinValue;
 
@@ -30,13 +31,13 @@ namespace BatteryTray
             TopMost = true;
             StartPosition = FormStartPosition.Manual;
             AutoScaleMode = AutoScaleMode.None;
-            Opacity = 0.88;
             AccessibleName = "设备电量面板";
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
             ApplyTheme();
+            _surface = new Bitmap(PanelWidth, PanelHeight, PixelFormat.Format32bppArgb);
 
             _positionTimer = new Timer();
-            _positionTimer.Interval = 2000;
+            _positionTimer.Interval = 500;
             _positionTimer.Tick += delegate { Reposition(); };
             _positionTimer.Start();
         }
@@ -51,9 +52,18 @@ namespace BatteryTray
             get
             {
                 CreateParams cp = base.CreateParams;
-                cp.ExStyle |= Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE | Native.WS_EX_TRANSPARENT;
+                cp.ExStyle |= Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE |
+                    Native.WS_EX_TRANSPARENT | Native.WS_EX_LAYERED;
                 return cp;
             }
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
         }
 
         public bool PanelEnabled
@@ -70,6 +80,7 @@ namespace BatteryTray
                 else
                 {
                     _positionTimer.Start();
+                    _dirty = true;
                     Reposition();
                 }
             }
@@ -89,13 +100,14 @@ namespace BatteryTray
                 _slots[i] = DeviceClassifier.BestForCategory(devices, categories[i]);
 
             ApplyTheme();
+            _dirty = true;
             Reposition();
-            Invalidate();
         }
 
         public void Reposition()
         {
             if (!_enabled) { Hide(); return; }
+            if (IsOverflowVisible()) { Hide(); return; }
 
             Rectangle clock;
             if (!TryGetClockRect(out clock))
@@ -114,48 +126,92 @@ namespace BatteryTray
                 : Screen.PrimaryScreen.Bounds;
             if (x + PanelWidth > screen.Right) x = screen.Right - PanelWidth;
 
+            bool moved = x != _lastX || y != _lastY;
             _lastX = x;
             _lastY = y;
 
-            if (!Visible)
+            if (_dirty)
             {
-                Bounds = new Rectangle(x, y, PanelWidth, PanelHeight);
-                Show();
+                RenderSurface();
+                _dirty = false;
             }
-            Native.SetWindowPos(Handle, Native.HWND_TOPMOST, x, y, PanelWidth, PanelHeight,
-                Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER | Native.SWP_SHOWWINDOW);
+
+            if (!Visible || moved)
+            {
+                UpdateLayered(x, y);
+                if (!Visible) Show();
+            }
+
+            Native.SetWindowPos(Handle, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        private void RenderSurface()
         {
-            base.OnPaint(e);
-            Graphics g = e.Graphics;
-            g.Clear(_background);
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-
-            using (Pen border = new Pen(_border))
-                g.DrawRectangle(border, 0, 0, Width - 1, Height - 1);
-
-            DeviceCategory[] categories = new DeviceCategory[]
+            using (Graphics g = Graphics.FromImage(_surface))
             {
-                DeviceCategory.Gamepad,
-                DeviceCategory.Mouse,
-                DeviceCategory.Keyboard,
-                DeviceCategory.Headset
-            };
+                g.Clear(Color.Transparent);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
 
-            for (int i = 0; i < categories.Length; i++)
+                DeviceCategory[] categories = new DeviceCategory[]
+                {
+                    DeviceCategory.Gamepad,
+                    DeviceCategory.Mouse,
+                    DeviceCategory.Keyboard,
+                    DeviceCategory.Headset
+                };
+
+                for (int i = 0; i < categories.Length; i++)
+                {
+                    int cellX = 10 + i * SlotWidth;
+                    DeviceBattery device = _slots[i];
+                    bool connected = device != null;
+                    bool stale = device != null && device.Stale;
+                    Color color = connected
+                        ? Color.FromArgb(stale ? 95 : 150, _foreground)
+                        : Color.FromArgb(45, _foreground);
+
+                    DrawCategoryIcon(g, categories[i], cellX + 11, 5, 28, color);
+                    DrawStatusGraphic(g, device, cellX + 9, 35, connected, stale);
+                }
+            }
+        }
+
+        private void UpdateLayered(int x, int y)
+        {
+            if (!IsHandleCreated)
             {
-                int cellX = 10 + i * SlotWidth;
-                DeviceBattery device = _slots[i];
-                bool connected = device != null;
-                bool stale = device != null && device.Stale;
-                Color color = connected
-                    ? Color.FromArgb(stale ? 95 : 150, _foreground)
-                    : Color.FromArgb(45, _foreground);
+                IntPtr created = Handle;
+            }
 
-                DrawCategoryIcon(g, categories[i], cellX + 11, 5, 28, color);
-                DrawStatusGraphic(g, device, cellX + 9, 35, connected, stale);
+            IntPtr screenDc = Native.GetDC(IntPtr.Zero);
+            IntPtr memDc = Native.CreateCompatibleDC(screenDc);
+            IntPtr bitmap = _surface.GetHbitmap(Color.FromArgb(0));
+            IntPtr oldBitmap = Native.SelectObject(memDc, bitmap);
+            try
+            {
+                Native.POINT destination = new Native.POINT();
+                destination.X = x;
+                destination.Y = y;
+                Native.SIZE size = new Native.SIZE();
+                size.CX = PanelWidth;
+                size.CY = PanelHeight;
+                Native.POINT source = new Native.POINT();
+                Native.BLENDFUNCTION blend = new Native.BLENDFUNCTION();
+                blend.BlendOp = 0;
+                blend.BlendFlags = 0;
+                blend.SourceConstantAlpha = 255;
+                blend.AlphaFormat = 1;
+
+                Native.UpdateLayeredWindow(Handle, screenDc, ref destination, ref size,
+                    memDc, ref source, IntPtr.Zero, ref blend, Native.ULW_ALPHA);
+            }
+            finally
+            {
+                Native.SelectObject(memDc, oldBitmap);
+                Native.DeleteObject(bitmap);
+                Native.DeleteDC(memDc);
+                Native.ReleaseDC(IntPtr.Zero, screenDc);
             }
         }
 
@@ -192,7 +248,7 @@ namespace BatteryTray
                 if (device.Percent == 0) fillWidth = 2;
                 if (fillWidth > 0)
                 {
-                    int alpha = stale ? 90 : 150;
+                    int alpha = stale ? 180 : 255;
                     using (SolidBrush fill = new SolidBrush(LevelColor(device.Percent, alpha)))
                         g.FillRectangle(fill, x + 2, y + 2, fillWidth, height - 4);
                 }
@@ -291,9 +347,9 @@ namespace BatteryTray
 
         private static Color LevelColor(int percent, int alpha)
         {
-            if (percent <= 20) return Color.FromArgb(alpha, 214, 69, 69);
-            if (percent <= 60) return Color.FromArgb(alpha, 217, 146, 45);
-            return Color.FromArgb(alpha, 46, 160, 96);
+            if (percent <= 20) return Color.FromArgb(alpha, 220, 120, 120);
+            if (percent <= 60) return Color.FromArgb(alpha, 225, 175, 100);
+            return Color.FromArgb(alpha, 120, 200, 155);
         }
 
         private void ApplyTheme()
@@ -315,18 +371,15 @@ namespace BatteryTray
             {
             }
 
-            if (light)
-            {
-                _background = Color.FromArgb(243, 243, 243);
-                _foreground = Color.FromArgb(30, 30, 30);
-                _border = Color.FromArgb(205, 205, 205);
-            }
-            else
-            {
-                _background = Color.FromArgb(31, 31, 31);
-                _foreground = Color.FromArgb(245, 245, 245);
-                _border = Color.FromArgb(70, 70, 70);
-            }
+            _foreground = light ? Color.FromArgb(30, 30, 30) : Color.FromArgb(245, 245, 245);
+        }
+
+        private static bool IsOverflowVisible()
+        {
+            IntPtr handle = Native.FindWindow("NotifyIconOverflowWindow", null);
+            if (Native.IsValidHandle(handle) && Native.IsWindowVisible(handle)) return true;
+            handle = Native.FindWindow("TopLevelWindowForOverflowXamlIsland", null);
+            return Native.IsValidHandle(handle) && Native.IsWindowVisible(handle);
         }
 
         private static bool TryGetClockRect(out Rectangle clock)
@@ -362,6 +415,7 @@ namespace BatteryTray
             {
                 _positionTimer.Stop();
                 _positionTimer.Dispose();
+                _surface.Dispose();
             }
             base.Dispose(disposing);
         }
