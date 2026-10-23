@@ -232,7 +232,8 @@ namespace BatteryTray
 
             int width = 32;
             int height = 10;
-            bool known = device != null && device.Supported && device.Percent >= 0;
+            int displayPercent = device != null ? device.DisplayPercent : -1;
+            bool known = device != null && device.Supported && displayPercent >= 0;
             Color outline = connected
                 ? Color.FromArgb(stale ? 70 : 105, _foreground)
                 : Color.FromArgb(30, _foreground);
@@ -246,12 +247,12 @@ namespace BatteryTray
 
             if (known)
             {
-                int fillWidth = (int)Math.Round((width - 5) * (device.Percent / 100.0));
-                if (device.Percent == 0) fillWidth = 2;
+                int fillWidth = (int)Math.Round((width - 5) * (displayPercent / 100.0));
+                if (displayPercent == 0) fillWidth = 2;
                 if (fillWidth > 0)
                 {
                     int alpha = stale ? 180 : 255;
-                    using (SolidBrush fill = new SolidBrush(LevelColor(device.Percent, alpha)))
+                    using (SolidBrush fill = new SolidBrush(LevelColor(displayPercent, alpha)))
                         g.FillRectangle(fill, x + 2, y + 2, fillWidth, height - 4);
                 }
             }

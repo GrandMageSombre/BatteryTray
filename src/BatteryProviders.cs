@@ -143,8 +143,8 @@ namespace BatteryTray
                     best = device;
                     continue;
                 }
-                if (device.Supported && device.Percent >= 0 &&
-                    (!best.Supported || best.Percent < 0 || device.Percent < best.Percent))
+                if (device.Supported && device.DisplayPercent >= 0 &&
+                    (!best.Supported || best.DisplayPercent < 0 || device.DisplayPercent < best.DisplayPercent))
                     best = device;
             }
             return best;

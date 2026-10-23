@@ -24,6 +24,15 @@ namespace BatteryTray
         Unknown = 3
     }
 
+    internal enum BatteryLevel
+    {
+        Unknown = 0,
+        Critical = 1,
+        Low = 2,
+        Good = 3,
+        Full = 4
+    }
+
     internal sealed class DeviceBattery
     {
         public string Key;
@@ -35,6 +44,34 @@ namespace BatteryTray
         public string Detail = "";
         public DeviceCategory Category = DeviceCategory.Other;
         public DeviceConnection Connection = DeviceConnection.Unknown;
+        public BatteryLevel Level = BatteryLevel.Unknown;
+
+        public int DisplayPercent
+        {
+            get
+            {
+                switch (Level)
+                {
+                    case BatteryLevel.Full: return 100;
+                    case BatteryLevel.Good: return 70;
+                    case BatteryLevel.Low: return 30;
+                    case BatteryLevel.Critical: return 10;
+                    default: return Percent;
+                }
+            }
+        }
+
+        public static string LevelName(BatteryLevel level)
+        {
+            switch (level)
+            {
+                case BatteryLevel.Full: return "满";
+                case BatteryLevel.Good: return "良好";
+                case BatteryLevel.Low: return "低";
+                case BatteryLevel.Critical: return "临界";
+                default: return "未知";
+            }
+        }
     }
 
     internal sealed class BatterySnapshot
@@ -245,59 +282,78 @@ namespace BatteryTray
             List<DeviceBattery> result = new List<DeviceBattery>();
             for (int index = 1; index <= 6; index++)
             {
-                ushort feature = BatteryStatusFeature;
                 int timeout = index <= 2 ? 200 : 120;
-                int statusFeature = connection.GetFeature(index, feature, reportId, 1, timeout);
+                int statusFeature = connection.GetFeature(index, BatteryStatusFeature, reportId, 1, timeout);
                 int unifiedFeature = -1;
-                int featureIndex = statusFeature;
-                if (statusFeature == 0)
-                {
-                    feature = UnifiedBatteryFeature;
-                    unifiedFeature = connection.GetFeature(index, feature, reportId, 1, timeout);
-                    featureIndex = unifiedFeature;
-                }
+                if (statusFeature > 0 || index <= 2)
+                    unifiedFeature = connection.GetFeature(index, UnifiedBatteryFeature, reportId, 1, timeout);
                 bool respondedUnsupported = statusFeature == 0 || unifiedFeature == 0;
-                if (featureIndex <= 0)
+                if (statusFeature <= 0 && unifiedFeature <= 0)
                 {
                     if (respondedUnsupported && index <= 2)
                         AddUnsupportedLogitechDevice(connection, index, reportId, receiverKey, group, result);
                     continue;
                 }
 
-                byte[] response;
-                if (feature == UnifiedBatteryFeature)
-                {
-                    byte[] capabilities = connection.Call(index, featureIndex, 0, reportId, null, 1, 200);
-                    if (capabilities == null || HidConnection.IsErrorResponse(capabilities)) continue;
-                    if ((capabilities[5] & 0x02) == 0) continue;
-                    response = connection.Call(index, featureIndex, 1, reportId, null, 1, 200);
-                }
-                else
-                {
-                    response = connection.Call(index, featureIndex, 0, reportId, null, 1, 200);
-                }
-                if (response == null || HidConnection.IsErrorResponse(response)) continue;
+                int percent = -1;
+                BatteryLevel level = BatteryLevel.Unknown;
+                string detail = "";
 
-                int percent = response[4];
-                if (feature == BatteryStatusFeature && percent == 0) percent = -1;
-                else if (percent > 100) percent = 100;
+                // 0x1004 优先：有百分比就显示百分比，只有档位标志就显示档位。
+                if (unifiedFeature > 0)
+                {
+                    byte[] capabilities = connection.Call(index, unifiedFeature, 0, reportId, null, 1, 200);
+                    if (capabilities != null && !HidConnection.IsErrorResponse(capabilities) && capabilities.Length > 5)
+                    {
+                        int reportedLevels = capabilities[4];
+                        int capsByte = capabilities[5];
+                        if ((capsByte & 0x02) != 0)
+                        {
+                            byte[] status = connection.Call(index, unifiedFeature, 1, reportId, null, 1, 200);
+                            if (status != null && !HidConnection.IsErrorResponse(status) && status.Length > 4)
+                            {
+                                percent = status[4];
+                                if (percent > 100) percent = 100;
+                                if (percent >= 0) detail = "HID++ 0x1004 统一电池：设备上报百分比";
+                            }
+                        }
+                        else if ((reportedLevels & 0x0F) != 0)
+                        {
+                            byte[] status = connection.Call(index, unifiedFeature, 1, reportId, null, 1, 200);
+                            if (status != null && !HidConnection.IsErrorResponse(status) && status.Length > 5)
+                            {
+                                byte levelCode = status[5];
+                                level = LogitechLevelFromCode(levelCode);
+                                if (level != BatteryLevel.Unknown)
+                                {
+                                    detail = "HID++ 0x1004 统一电池：设备档位 " + DeviceBattery.LevelName(level) +
+                                        "（档位代码 " + levelCode.ToString(CultureInfo.InvariantCulture) + "，仅上报档位）";
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 没有百分比也没有档位时，回退到 0x1000 的原始百分比。
+                if (percent < 0 && level == BatteryLevel.Unknown && statusFeature > 0)
+                {
+                    byte[] response = connection.Call(index, statusFeature, 0, reportId, null, 1, 200);
+                    if (response != null && !HidConnection.IsErrorResponse(response) && response.Length > 4)
+                    {
+                        percent = response[4];
+                        if (percent == 0) percent = -1;
+                        else if (percent > 100) percent = 100;
+                        if (percent >= 0)
+                            detail = "HID++ 0x1000 电池状态：设备原始值 " +
+                                percent.ToString(CultureInfo.InvariantCulture) + "%";
+                    }
+                }
+
+                if (percent < 0 && level == BatteryLevel.Unknown) continue;
 
                 DeviceCategory category = GetLogitechCategory(connection, index, reportId, group);
                 string categoryName = DeviceClassifier.CategoryName(category);
                 bool fitsCategory = category != DeviceCategory.Other;
-
-                string detail;
-                if (feature == BatteryStatusFeature)
-                {
-                    byte levelCode = response.Length > 5 ? response[5] : (byte)0;
-                    detail = "HID++ 0x1000 电池状态：设备档位 " + LogitechBatteryLevelName(levelCode) +
-                        "（档位代码 " + levelCode.ToString(CultureInfo.InvariantCulture) + "，粗粒度；设备原始值 " +
-                        (percent >= 0 ? percent.ToString(CultureInfo.InvariantCulture) + "%" : "未知") + "）";
-                }
-                else
-                {
-                    detail = "HID++ 0x1004 统一电池：状态 0x" + response[6].ToString("X2", CultureInfo.InvariantCulture);
-                }
 
                 DeviceBattery device = new DeviceBattery
                 {
@@ -312,6 +368,7 @@ namespace BatteryTray
                     Connection = DeviceConnection.UsbReceiver,
                     Supported = true,
                     Percent = percent,
+                    Level = level,
                     Detail = detail
                 };
                 result.Add(device);
@@ -319,13 +376,17 @@ namespace BatteryTray
             return result;
         }
 
-        private static string LogitechBatteryLevelName(byte code)
+        private static BatteryLevel LogitechLevelFromCode(byte code)
         {
-            if (code >= 1 && code <= 2) return "临界";
-            if (code >= 3 && code <= 4) return "低";
-            if (code >= 5 && code <= 6) return "良好";
-            if (code == 7) return "满";
-            return "未知";
+            // 0x1004 档位为位标志：1 临界、2 低、4 良好、8 满。
+            switch (code)
+            {
+                case 1: return BatteryLevel.Critical;
+                case 2: return BatteryLevel.Low;
+                case 4: return BatteryLevel.Good;
+                case 8: return BatteryLevel.Full;
+                default: return BatteryLevel.Unknown;
+            }
         }
 
         private static void AddUnsupportedLogitechDevice(HidConnection connection, int index, byte reportId,

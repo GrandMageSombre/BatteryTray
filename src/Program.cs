@@ -282,16 +282,16 @@ namespace BatteryTray
                 for (int i = 0; i < fresh.Devices.Count; i++)
                 {
                     DeviceBattery candidate = fresh.Devices[i];
-                    if (candidate.Supported && candidate.Percent >= 0 && candidate.Category != DeviceCategory.Other)
+                    if (candidate.Supported && candidate.DisplayPercent >= 0 && candidate.Category != DeviceCategory.Other)
                     {
                         cacheDevice = candidate;
                         break;
                     }
                 }
                 if (cacheDevice != null &&
-                    (cacheDevice.Percent != _cachedPercent || (int)cacheDevice.Category != _cachedCategory))
+                    (cacheDevice.DisplayPercent != _cachedPercent || (int)cacheDevice.Category != _cachedCategory))
                 {
-                    _cachedPercent = cacheDevice.Percent;
+                    _cachedPercent = cacheDevice.DisplayPercent;
                     _cachedCategory = (int)cacheDevice.Category;
                     WriteSetting("LastPercent", _cachedPercent);
                     WriteSetting("LastCategory", _cachedCategory);
@@ -313,7 +313,8 @@ namespace BatteryTray
                     .Append(device.Category).Append('/')
                     .Append(device.Connection).Append('/')
                     .Append(device.Supported).Append('/')
-                    .Append(device.Percent).Append(']');
+                    .Append(device.Percent).Append('/')
+                    .Append(device.Level).Append(']');
             }
 
             string text = signature.ToString();
@@ -341,9 +342,9 @@ namespace BatteryTray
                 for (int i = 0; i < _snapshot.Devices.Count; i++)
                 {
                     DeviceBattery device = _snapshot.Devices[i];
-                    if (!device.Supported || device.Percent < 0) continue;
+                    if (!device.Supported || device.DisplayPercent < 0) continue;
                     hasBattery = true;
-                    if (percent < 0 || device.Percent < percent) percent = device.Percent;
+                    if (percent < 0 || device.DisplayPercent < percent) percent = device.DisplayPercent;
                 }
             }
 
@@ -384,7 +385,9 @@ namespace BatteryTray
 
                 if (!first) builder.Append(" · ");
                 builder.Append(DeviceClassifier.CategoryName(categories[i]));
-                if (device.Supported && device.Percent >= 0)
+                if (device.Supported && device.Level != BatteryLevel.Unknown)
+                    builder.Append(' ').Append(DeviceBattery.LevelName(device.Level)).Append("（粗）");
+                else if (device.Supported && device.Percent >= 0)
                     builder.Append(' ').Append(device.Percent.ToString(CultureInfo.InvariantCulture)).Append('%');
                 else if (device.Connection == DeviceConnection.Bluetooth)
                     builder.Append(" 蓝牙");
@@ -392,8 +395,6 @@ namespace BatteryTray
                     builder.Append(" 有线");
                 else
                     builder.Append(" 无电量");
-                if (device.Detail.IndexOf("粗粒度", StringComparison.Ordinal) >= 0)
-                    builder.Append("（粗）");
                 first = false;
             }
 
@@ -436,7 +437,15 @@ namespace BatteryTray
                         builder.Append("· ").Append(DeviceClassifier.CategoryName(categories[i]))
                             .Append("：").Append(device.Label)
                             .Append("（").Append(DeviceClassifier.ConnectionName(device.Connection)).Append("）");
-                        if (device.Supported && device.Percent >= 0)
+                        if (device.Supported && device.Level != BatteryLevel.Unknown)
+                        {
+                            builder.Append(" ").Append(DeviceBattery.LevelName(device.Level));
+                            if (device.Percent >= 0)
+                                builder.Append("（固件原始 ").Append(device.Percent.ToString(CultureInfo.InvariantCulture)).Append("%）");
+                            else
+                                builder.Append("（设备只上报档位）");
+                        }
+                        else if (device.Supported && device.Percent >= 0)
                             builder.Append(" ").Append(device.Percent.ToString(CultureInfo.InvariantCulture)).Append('%');
                         else
                             builder.Append(" 无可读电量");
@@ -464,7 +473,7 @@ namespace BatteryTray
 
             builder.AppendLine();
             builder.AppendLine("说明：支持标准 HID 电池字段、罗技 HID++ 2.0 和已识别的蓝牙设备；私有协议需按品牌单独适配。");
-            builder.AppendLine("部分罗技键盘只上报粗粒度档位（临界/低/良好/满），不支持电压百分比；更换 1.3V/1.6V 电池后可能仍显示同一档。");
+            builder.AppendLine("设备提供档位（0x1004）时按档位显示；只报原始百分比时按百分比显示。如罗技 K270 固件只返回 5% 或 30%，30% 对应“良好”。");
             MessageBox.Show(builder.ToString(), "设备状态", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
