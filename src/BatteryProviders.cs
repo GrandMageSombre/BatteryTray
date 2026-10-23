@@ -3,6 +3,12 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Management;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Windows.Devices.Bluetooth;
+using Windows.Devices.Bluetooth.GenericAttributeProfile;
+using Windows.Devices.Enumeration;
+using Windows.Storage.Streams;
 
 namespace BatteryTray
 {
@@ -338,6 +344,9 @@ namespace BatteryTray
                 string vendor = VendorCatalog.GetVendorName(info.Vid);
                 string vendorLabel = vendor != null ? vendor : "未知品牌";
                 string categoryName = DeviceClassifier.CategoryName(category);
+                string detail = DeviceClassifier.ConnectionName(connection) + "；未读取到电量";
+                if (vendor == "罗技" && category == DeviceCategory.Mouse)
+                    detail = "2.4G；该鼠标未提供电量上报（HID++ 2.0 特性表与 1.0 寄存器均不可用）";
 
                 snapshot.Devices.Add(new DeviceBattery
                 {
@@ -348,7 +357,7 @@ namespace BatteryTray
                     Connection = connection,
                     Supported = false,
                     Percent = -1,
-                    Detail = DeviceClassifier.ConnectionName(connection) + "；未读取到电量"
+                    Detail = detail
                 });
             }
         }
@@ -428,6 +437,155 @@ namespace BatteryTray
         }
     }
 
+    internal sealed class BleGattBatteryProvider : IBatteryProvider
+    {
+        private static readonly object CacheLock = new object();
+        private static Dictionary<string, int> _cache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private static DateTime _cacheAt = DateTime.MinValue;
+        private static int _scanning;
+
+        public string Name
+        {
+            get { return "BLE GATT 电池"; }
+        }
+
+        public void Read(List<HidInterfaceInfo> interfaces, BatterySnapshot snapshot)
+        {
+            Dictionary<string, int> cache;
+            lock (CacheLock)
+            {
+                if ((DateTime.UtcNow - _cacheAt).TotalSeconds > 120)
+                    _cache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                cache = _cache;
+            }
+
+            foreach (KeyValuePair<string, int> pair in cache)
+            {
+                DeviceBattery existing = null;
+                for (int i = 0; i < snapshot.Devices.Count; i++)
+                {
+                    DeviceBattery device = snapshot.Devices[i];
+                    if (device.Connection == DeviceConnection.Bluetooth &&
+                        (string.Equals(device.Label, pair.Key, StringComparison.OrdinalIgnoreCase) ||
+                         device.Label.IndexOf(pair.Key, StringComparison.OrdinalIgnoreCase) >= 0))
+                    {
+                        existing = device;
+                        break;
+                    }
+                }
+
+                if (existing != null)
+                {
+                    existing.Supported = true;
+                    existing.Percent = pair.Value;
+                    existing.Detail = "BLE GATT 电池服务（0x2A19）";
+                    continue;
+                }
+
+                DeviceCategory category = DeviceClassifier.FromProductName(pair.Key);
+                if (category == DeviceCategory.Other) continue;
+                snapshot.Devices.Add(new DeviceBattery
+                {
+                    Key = "ble:" + pair.Key + ":" + category,
+                    Label = pair.Key,
+                    ShortLabel = "蓝牙" + DeviceClassifier.CategoryName(category),
+                    Category = category,
+                    Connection = DeviceConnection.Bluetooth,
+                    Supported = true,
+                    Percent = pair.Value,
+                    Detail = "BLE GATT 电池服务（0x2A19）"
+                });
+            }
+
+            EnsureScan();
+        }
+
+        private static void EnsureScan()
+        {
+            lock (CacheLock)
+            {
+                if (_scanning == 1 || (DateTime.UtcNow - _cacheAt).TotalSeconds < 30) return;
+                _scanning = 1;
+            }
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Dictionary<string, int> results;
+                try
+                {
+                    results = Scan();
+                }
+                catch
+                {
+                    results = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                }
+
+                lock (CacheLock)
+                {
+                    _cache = results;
+                    _cacheAt = DateTime.UtcNow;
+                    _scanning = 0;
+                }
+            });
+        }
+
+        private static Dictionary<string, int> Scan()
+        {
+            Dictionary<string, int> results = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            DeviceInformationCollection devices = DeviceInformation.FindAllAsync(
+                BluetoothLEDevice.GetDeviceSelector()).AsTask().Result;
+
+            foreach (DeviceInformation info in devices)
+            {
+                BluetoothLEDevice device = null;
+                try
+                {
+                    Task<BluetoothLEDevice> connect = BluetoothLEDevice.FromIdAsync(info.Id).AsTask();
+                    if (!connect.Wait(3000) || connect.Result == null) continue;
+                    device = connect.Result;
+
+                    Task<GattDeviceServicesResult> servicesTask = device.GetGattServicesAsync().AsTask();
+                    if (!servicesTask.Wait(4000) || servicesTask.Result.Status != GattCommunicationStatus.Success)
+                        continue;
+
+                    int percent = -1;
+                    foreach (GattDeviceService service in servicesTask.Result.Services)
+                    {
+                        Task<GattCharacteristicsResult> characteristicsTask = service.GetCharacteristicsAsync().AsTask();
+                        if (!characteristicsTask.Wait(3000) ||
+                            characteristicsTask.Result.Status != GattCommunicationStatus.Success)
+                            continue;
+
+                        foreach (GattCharacteristic characteristic in characteristicsTask.Result.Characteristics)
+                        {
+                            if (characteristic.Uuid != GattCharacteristicUuids.BatteryLevel) continue;
+                            Task<GattReadResult> readTask = characteristic.ReadValueAsync().AsTask();
+                            if (!readTask.Wait(3000) ||
+                                readTask.Result.Status != GattCommunicationStatus.Success)
+                                continue;
+
+                            using (DataReader reader = DataReader.FromBuffer(readTask.Result.Value))
+                                percent = reader.ReadByte();
+                            break;
+                        }
+                        if (percent >= 0) break;
+                    }
+
+                    if (percent >= 0 && !string.IsNullOrEmpty(info.Name))
+                        results[info.Name] = percent;
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    if (device != null) device.Dispose();
+                }
+            }
+            return results;
+        }
+    }
+
     internal sealed class BluetoothDeviceProvider : IBatteryProvider
     {
         private static readonly object CacheLock = new object();
@@ -464,7 +622,7 @@ namespace BatteryTray
                     Connection = DeviceConnection.Bluetooth,
                     Supported = false,
                     Percent = -1,
-                    Detail = "蓝牙设备已识别；当前工具链未接入 BLE GATT 电量"
+                    Detail = "蓝牙设备已识别；未找到标准 GATT 电量服务"
                 });
             }
         }

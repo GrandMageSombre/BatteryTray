@@ -96,7 +96,8 @@ namespace BatteryTray
                 new GenericHidBatteryProvider(),
                 new DevicePresenceProvider(),
                 new BluetoothDeviceProvider(),
-                new XInputGamepadProvider()
+                new XInputGamepadProvider(),
+                new BleGattBatteryProvider()
             };
             for (int i = 0; i < providers.Length; i++)
             {
@@ -245,15 +246,23 @@ namespace BatteryTray
             for (int index = 1; index <= 6; index++)
             {
                 ushort feature = BatteryStatusFeature;
-                int attempts = index <= 2 ? 2 : 1;
-                int timeout = index <= 2 ? 450 : 250;
-                int featureIndex = connection.GetFeature(index, feature, reportId, attempts, timeout);
-                if (featureIndex == 0)
+                int timeout = index <= 2 ? 300 : 200;
+                int statusFeature = connection.GetFeature(index, feature, reportId, 1, timeout);
+                int unifiedFeature = -1;
+                int featureIndex = statusFeature;
+                if (statusFeature == 0)
                 {
                     feature = UnifiedBatteryFeature;
-                    featureIndex = connection.GetFeature(index, feature, reportId, attempts, timeout);
+                    unifiedFeature = connection.GetFeature(index, feature, reportId, 1, timeout);
+                    featureIndex = unifiedFeature;
                 }
-                if (featureIndex <= 0) continue;
+                bool respondedUnsupported = statusFeature == 0 || unifiedFeature == 0;
+                if (featureIndex <= 0)
+                {
+                    if (respondedUnsupported && index <= 2)
+                        AddUnsupportedLogitechDevice(connection, index, reportId, receiverKey, group, result);
+                    continue;
+                }
 
                 byte[] response;
                 if (feature == UnifiedBatteryFeature)
@@ -261,11 +270,11 @@ namespace BatteryTray
                     byte[] capabilities = connection.Call(index, featureIndex, 0, reportId, null, 1, 300);
                     if (capabilities == null || HidConnection.IsErrorResponse(capabilities)) continue;
                     if ((capabilities[5] & 0x02) == 0) continue;
-                    response = connection.Call(index, featureIndex, 1, reportId, null, 2, 450);
+                    response = connection.Call(index, featureIndex, 1, reportId, null, 1, 300);
                 }
                 else
                 {
-                    response = connection.Call(index, featureIndex, 0, reportId, null, 2, 450);
+                    response = connection.Call(index, featureIndex, 0, reportId, null, 1, 300);
                 }
                 if (response == null || HidConnection.IsErrorResponse(response)) continue;
 
@@ -297,6 +306,32 @@ namespace BatteryTray
                 result.Add(device);
             }
             return result;
+        }
+
+        private static void AddUnsupportedLogitechDevice(HidConnection connection, int index, byte reportId,
+            string receiverKey, List<HidInterfaceInfo> group, List<DeviceBattery> result)
+        {
+            int nameFeature = connection.GetFeature(index, 0x0005, reportId, 1, 200);
+            if (nameFeature <= 0) return;
+
+            string name = ReadLogitechName(connection, index, nameFeature, reportId).Trim();
+            DeviceCategory category = GetLogitechCategory(connection, index, reportId, group);
+            string categoryName = DeviceClassifier.CategoryName(category);
+            string label = !string.IsNullOrEmpty(name)
+                ? "罗技 " + name
+                : "罗技 " + categoryName;
+
+            result.Add(new DeviceBattery
+            {
+                Key = receiverKey + ":" + index.ToString(CultureInfo.InvariantCulture) + ":nobattery",
+                Label = label,
+                ShortLabel = "罗技" + categoryName,
+                Category = category,
+                Connection = DeviceConnection.UsbReceiver,
+                Supported = false,
+                Percent = -1,
+                Detail = "该设备未提供电量上报（HID++ 2.0 特性表与 1.0 寄存器均不可用）"
+            });
         }
 
         private static DeviceCategory GetLogitechCategory(HidConnection connection, int index, byte reportId, List<HidInterfaceInfo> group)

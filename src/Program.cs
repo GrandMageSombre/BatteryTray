@@ -44,7 +44,7 @@ namespace BatteryTray
 
     internal sealed class TrayContext : ApplicationContext
     {
-        private const int PollIntervalMilliseconds = 10000;
+        private const int PollIntervalMilliseconds = 2000;
         private const string SettingsKeyPath = @"Software\2.4GBattery";
 
         private readonly SynchronizationContext _ui;
@@ -53,6 +53,7 @@ namespace BatteryTray
         private ToolStripMenuItem _panelItem;
         private ToolStripMenuItem _autoStartItem;
         private readonly DevicePanelForm _panel;
+        private readonly DeviceChangeWindow _deviceWindow;
         private readonly System.Windows.Forms.Timer _timer;
         private BatterySnapshot _snapshot;
         private DateTime _lastSuccess = DateTime.MinValue;
@@ -63,6 +64,7 @@ namespace BatteryTray
         private bool _exiting;
         private bool _suppressAutoStartEvent;
         private int _polling;
+        private int _refreshPending;
         private int _failedPolls;
         private int _cachedPercent;
         private int _cachedCategory;
@@ -124,6 +126,9 @@ namespace BatteryTray
             _timer.Interval = PollIntervalMilliseconds;
             _timer.Tick += delegate { RefreshNow(); };
             _timer.Start();
+
+            _deviceWindow = new DeviceChangeWindow();
+            _deviceWindow.DeviceChanged += delegate { RefreshNow(); };
 
             RefreshNow();
         }
@@ -188,7 +193,11 @@ namespace BatteryTray
         private void RefreshNow()
         {
             if (_exiting) return;
-            if (Interlocked.Exchange(ref _polling, 1) == 1) return;
+            if (Interlocked.Exchange(ref _polling, 1) == 1)
+            {
+                Interlocked.Exchange(ref _refreshPending, 1);
+                return;
+            }
 
             ThreadPool.QueueUserWorkItem(delegate
             {
@@ -220,6 +229,9 @@ namespace BatteryTray
                 catch
                 {
                 }
+
+                if (Interlocked.Exchange(ref _refreshPending, 0) == 1)
+                    RefreshNow();
             });
         }
 
@@ -296,10 +308,14 @@ namespace BatteryTray
                 string prefix = KeyPrefix(oldDevice.Key);
                 bool receiverPresent = false;
                 bool sameCategoryRefreshed = false;
+                bool sameCategoryPresent = false;
                 bool cacheEntry = oldDevice.Key == "cache";
                 for (int j = 0; j < fresh.Devices.Count; j++)
                 {
                     DeviceBattery freshDevice = fresh.Devices[j];
+                    if (freshDevice.Category == oldDevice.Category)
+                        sameCategoryPresent = true;
+
                     if (cacheEntry)
                     {
                         if (freshDevice.Category == oldDevice.Category)
@@ -313,7 +329,7 @@ namespace BatteryTray
                         sameCategoryRefreshed = true;
                 }
 
-                if (!receiverPresent || sameCategoryRefreshed) continue;
+                if (!receiverPresent || !sameCategoryPresent || sameCategoryRefreshed) continue;
                 oldDevice.Stale = true;
                 merged.Devices.Add(oldDevice);
             }
@@ -410,7 +426,7 @@ namespace BatteryTray
         {
             StringBuilder builder = new StringBuilder();
             builder.AppendLine("设备电量");
-            builder.AppendLine("刷新间隔：10 秒");
+            builder.AppendLine("刷新间隔：2 秒");
             if (_lastSuccess != DateTime.MinValue)
                 builder.AppendLine("最近成功读取：" + _lastSuccess.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
             builder.AppendLine();
@@ -535,8 +551,33 @@ namespace BatteryTray
 
             _panel.Close();
             _panel.Dispose();
+            if (_deviceWindow != null) _deviceWindow.DestroyHandle();
             _menu.Dispose();
             base.ExitThreadCore();
+        }
+    }
+
+    internal sealed class DeviceChangeWindow : NativeWindow
+    {
+        private const int WM_DEVICECHANGE = 0x0219;
+
+        public event EventHandler DeviceChanged;
+
+        public DeviceChangeWindow()
+        {
+            CreateParams cp = new CreateParams();
+            cp.Caption = "BatteryTrayDeviceChange";
+            CreateHandle(cp);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_DEVICECHANGE)
+            {
+                EventHandler handler = DeviceChanged;
+                if (handler != null) handler(this, EventArgs.Empty);
+            }
+            base.WndProc(ref m);
         }
     }
 
