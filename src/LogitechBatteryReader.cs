@@ -286,6 +286,19 @@ namespace BatteryTray
                 string categoryName = DeviceClassifier.CategoryName(category);
                 bool fitsCategory = category != DeviceCategory.Other;
 
+                string detail;
+                if (feature == BatteryStatusFeature)
+                {
+                    byte levelCode = response.Length > 5 ? response[5] : (byte)0;
+                    detail = "HID++ 0x1000 电池状态：设备档位 " + LogitechBatteryLevelName(levelCode) +
+                        "（档位代码 " + levelCode.ToString(CultureInfo.InvariantCulture) + "，粗粒度；设备原始值 " +
+                        (percent >= 0 ? percent.ToString(CultureInfo.InvariantCulture) + "%" : "未知") + "）";
+                }
+                else
+                {
+                    detail = "HID++ 0x1004 统一电池：状态 0x" + response[6].ToString("X2", CultureInfo.InvariantCulture);
+                }
+
                 DeviceBattery device = new DeviceBattery
                 {
                     Key = receiverKey + ":" + index.ToString(CultureInfo.InvariantCulture),
@@ -299,13 +312,20 @@ namespace BatteryTray
                     Connection = DeviceConnection.UsbReceiver,
                     Supported = true,
                     Percent = percent,
-                    Detail = feature == BatteryStatusFeature
-                        ? "电池状态特性：下一档 " + response[5].ToString(CultureInfo.InvariantCulture) + "%，状态 0x" + response[6].ToString("X2", CultureInfo.InvariantCulture)
-                        : "统一电池特性：状态 0x" + response[6].ToString("X2", CultureInfo.InvariantCulture)
+                    Detail = detail
                 };
                 result.Add(device);
             }
             return result;
+        }
+
+        private static string LogitechBatteryLevelName(byte code)
+        {
+            if (code >= 1 && code <= 2) return "临界";
+            if (code >= 3 && code <= 4) return "低";
+            if (code >= 5 && code <= 6) return "良好";
+            if (code == 7) return "满";
+            return "未知";
         }
 
         private static void AddUnsupportedLogitechDevice(HidConnection connection, int index, byte reportId,

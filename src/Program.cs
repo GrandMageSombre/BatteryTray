@@ -392,6 +392,8 @@ namespace BatteryTray
                     builder.Append(" 有线");
                 else
                     builder.Append(" 无电量");
+                if (device.Detail.IndexOf("粗粒度", StringComparison.Ordinal) >= 0)
+                    builder.Append("（粗）");
                 first = false;
             }
 
@@ -462,6 +464,7 @@ namespace BatteryTray
 
             builder.AppendLine();
             builder.AppendLine("说明：支持标准 HID 电池字段、罗技 HID++ 2.0 和已识别的蓝牙设备；私有协议需按品牌单独适配。");
+            builder.AppendLine("部分罗技键盘只上报粗粒度档位（临界/低/良好/满），不支持电压百分比；更换 1.3V/1.6V 电池后可能仍显示同一档。");
             MessageBox.Show(builder.ToString(), "设备状态", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
