@@ -472,8 +472,9 @@ namespace BatteryTray
             }
 
             builder.AppendLine();
-            builder.AppendLine("说明：支持标准 HID 电池字段、罗技 HID++ 2.0 和已识别的蓝牙设备；私有协议需按品牌单独适配。");
+            builder.AppendLine("说明：支持标准 HID 电池字段（Feature/Input 报告）、罗技 HID++ 2.0、黑爵 2.4G 协议和已识别的蓝牙设备；其余私有协议需按品牌单独适配。");
             builder.AppendLine("设备提供档位（0x1004）时按档位显示；只报原始百分比时按百分比显示。如罗技 K270 固件只返回 5% 或 30%，30% 对应“良好”。");
+            builder.AppendLine("若设备显示“USB 有线”但实际工作在 2.4G：说明接收器没有暴露可识别的无线特征，可运行仓库内 tools/HidDump 采集该设备的 HID 信息。");
             MessageBox.Show(builder.ToString(), "设备状态", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 

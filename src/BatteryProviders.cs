@@ -33,8 +33,22 @@ namespace BatteryTray
                 case 0x24AE: return "雷柏";
                 case 0x09DA: return "双飞燕";
                 case 0x045E: return "微软";
+                case 0x2DC8: return "八位堂";
+                case 0x249A: return "黑爵";
+                case 0x248A: return "黑爵";
                 default: return null;
             }
+        }
+
+        /// <summary>先查已知设备档案，再查 VID 表，最后退回产品名关键词。</summary>
+        public static string GetVendorName(HidInterfaceInfo info)
+        {
+            if (info == null) return null;
+            KnownDevice known = KnownDevices.Find(info.Vid, info.Pid);
+            if (known != null) return known.Vendor;
+            string name = GetVendorName(info.Vid);
+            if (name != null) return name;
+            return KnownDevices.VendorFromProduct(info.Product);
         }
     }
 
@@ -87,12 +101,14 @@ namespace BatteryTray
 
             if (ContainsAny(value, "headset", "headphone", "earbud", "earphone", "buds", "airpods", "耳机", "耳麦", "qcy", "soundcore", "freebuds", "jabra", "turtle beach", "arctis"))
                 return DeviceCategory.Headset;
-            if (ContainsAny(value, "gamepad", "game controller", "joystick", "手柄", "xbox", "dualsense", "dualshock", "8bitdo", "北通", "飞智", "betop"))
-                return DeviceCategory.Gamepad;
-            if (ContainsAny(value, "keyboard", "键盘"))
+            // 先判断明确的键盘/鼠标词，再看手柄词：否则 "8BitDo Retro Keyboard"
+            // 会因为品牌词命中手柄，被误判成游戏手柄。
+            if (ContainsAny(value, "keyboard", "键盘", "keypad"))
                 return DeviceCategory.Keyboard;
             if (ContainsAny(value, "mouse", "鼠标"))
                 return DeviceCategory.Mouse;
+            if (ContainsAny(value, "gamepad", "game controller", "joystick", "手柄", "xbox", "dualsense", "dualshock", "8bitdo", "北通", "飞智", "betop"))
+                return DeviceCategory.Gamepad;
             return DeviceCategory.Other;
         }
 
@@ -114,10 +130,73 @@ namespace BatteryTray
                 path.IndexOf("bth", StringComparison.OrdinalIgnoreCase) >= 0)
                 return DeviceConnection.Bluetooth;
 
+            // 有公开档案的 VID/PID 直接按档案判定：接收器和键盘本体通常 PID 不同，
+            // 例如八位堂 Retro Keyboard 有线是 5200、2.4G 接收器是 5201。
+            KnownDevice known = KnownDevices.Find(info.Vid, info.Pid);
+            if (known != null) return known.Connection;
+
+            if (IsWiredProductName(info.Product))
+                return DeviceConnection.UsbWired;
+
+            if (HasWirelessProductName(info, group))
+                return DeviceConnection.UsbReceiver;
+
+            // 罗技有线设备同样带 0xFF00 厂商集合（HID++ 配置通道），
+            // 不能据此判成 2.4G，只能靠接收器 PID 白名单区分。
+            if (info.Vid == LogitechVendorId)
+                return IsLogitechReceiver(info.Pid) ? DeviceConnection.UsbReceiver : DeviceConnection.UsbWired;
+
             if (HasVendorCollection(group))
                 return DeviceConnection.UsbReceiver;
 
             return DeviceConnection.UsbWired;
+        }
+
+        private const ushort LogitechVendorId = 0x046D;
+
+        /// <summary>罗技接收器的已知 PID：Unifying（C52B/C532/C534/C539）、Nano（C52F）、Bolt（C548）。</summary>
+        private static bool IsLogitechReceiver(ushort pid)
+        {
+            switch (pid)
+            {
+                case 0xC52B:
+                case 0xC532:
+                case 0xC534:
+                case 0xC539:
+                case 0xC52F:
+                case 0xC548:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static bool IsWiredProductName(string product)
+        {
+            if (string.IsNullOrEmpty(product)) return false;
+            string value = product.ToLowerInvariant();
+            return ContainsAny(value, "wired", "有线");
+        }
+
+        private static bool HasWirelessProductName(HidInterfaceInfo info, List<HidInterfaceInfo> group)
+        {
+            if (IsWirelessName(info.Product)) return true;
+            if (group != null)
+            {
+                for (int i = 0; i < group.Count; i++)
+                {
+                    if (IsWirelessName(group[i].Product)) return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool IsWirelessName(string product)
+        {
+            if (string.IsNullOrEmpty(product)) return false;
+            string value = product.ToLowerInvariant();
+            return ContainsAny(value, "2.4g", "2.4ghz", "receiver", "dongle", "wireless",
+                "unifying", "lightspeed", "接收器", "无线");
         }
 
         public static bool HasVendorCollection(List<HidInterfaceInfo> group)
@@ -125,7 +204,8 @@ namespace BatteryTray
             if (group == null) return false;
             for (int i = 0; i < group.Count; i++)
             {
-                if (group[i].UsagePage == 0xFF00) return true;
+                // 厂商自定义页是整个 0xFF00–0xFFFF 区间，不只是罗技常用的 0xFF00。
+                if (group[i].UsagePage >= 0xFF00) return true;
             }
             return false;
         }
@@ -162,10 +242,17 @@ namespace BatteryTray
 
     internal sealed class GenericHidBatteryProvider : IBatteryProvider
     {
+        private const int HidpInput = 0;
         private const int HidpFeature = 2;
         private const int HidpStatusSuccess = 0x00110000;
         private const ushort GenericDeviceControlsPage = 0x06;
         private const ushort BatteryStrengthUsage = 0x20;
+
+        // HidD_GetInputReport 是同步调用，设备不响应时会卡住整轮轮询。
+        // 失败后 5 分钟内不再对该接口重试，避免每秒阻塞一次。
+        private static readonly object InputSkipLock = new object();
+        private static readonly Dictionary<string, DateTime> InputSkipUntil =
+            new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
 
         public string Name
         {
@@ -175,19 +262,22 @@ namespace BatteryTray
         public void Read(List<HidInterfaceInfo> interfaces, BatterySnapshot snapshot)
         {
             Dictionary<string, List<HidInterfaceInfo>> groups = BatteryReader.GroupReceivers(interfaces);
-            HashSet<string> seenReceivers = new HashSet<string>(StringComparer.Ordinal);
+            HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
             for (int i = 0; i < interfaces.Count; i++)
             {
                 HidInterfaceInfo info = interfaces[i];
-                if (info.FeatureReportLength <= 0) continue;
+                // 电量既可能在 Feature 报告，也可能在 Input 报告，两者都不能漏。
+                if (info.FeatureReportLength <= 0 && info.InputReportLength <= 0) continue;
                 if (info.Path.IndexOf("VID_", StringComparison.OrdinalIgnoreCase) < 0) continue;
 
                 string receiverKey = DeviceClassifier.ReceiverKey(info);
-                if (seenReceivers.Contains(receiverKey)) continue;
-
                 List<HidInterfaceInfo> group;
                 groups.TryGetValue(receiverKey, out group);
                 if (info.Vid == 0x046D && DeviceClassifier.HasVendorCollection(group)) continue;
+
+                // 已适配私有协议的设备不重复走通用通道。
+                KnownDevice known = KnownDevices.Find(info.Vid, info.Pid);
+                if (known != null && known.HasBatteryProtocol) continue;
 
                 int percent;
                 string detail;
@@ -197,13 +287,17 @@ namespace BatteryTray
                 if (category == DeviceCategory.Other && !string.IsNullOrEmpty(info.Product))
                     category = DeviceClassifier.FromProductName(info.Product);
 
-                string vendor = VendorCatalog.GetVendorName(info.Vid);
+                // 按"接收器 + 类别"去重：同一个接收器下的键盘和鼠标都要保留。
+                if (!seen.Add(receiverKey + ":" + category)) continue;
+                if (HasSupportedDevice(snapshot, receiverKey, category)) continue;
+
+                string vendor = VendorCatalog.GetVendorName(info);
                 string vendorLabel = vendor != null ? vendor : "未知品牌";
                 string categoryName = DeviceClassifier.CategoryName(category);
 
                 snapshot.Devices.Add(new DeviceBattery
                 {
-                    Key = receiverKey + ":hidbattery",
+                    Key = receiverKey + ":hidbattery:" + category,
                     Label = vendorLabel + " " + categoryName,
                     ShortLabel = vendorLabel + categoryName,
                     Category = category,
@@ -212,8 +306,20 @@ namespace BatteryTray
                     Percent = percent,
                     Detail = detail
                 });
-                seenReceivers.Add(receiverKey);
             }
+        }
+
+        private static bool HasSupportedDevice(BatterySnapshot snapshot, string receiverKey, DeviceCategory category)
+        {
+            string prefix = receiverKey + ":";
+            for (int i = 0; i < snapshot.Devices.Count; i++)
+            {
+                DeviceBattery device = snapshot.Devices[i];
+                if (device.Supported && device.Category == category &&
+                    device.Key.StartsWith(prefix, StringComparison.Ordinal))
+                    return true;
+            }
+            return false;
         }
 
         private static bool TryReadBattery(HidInterfaceInfo info, out int percent, out string detail)
@@ -236,62 +342,103 @@ namespace BatteryTray
                 caps.Reserved = new ushort[17];
                 caps.Reserved2 = new ushort[10];
                 if (Native.HidP_GetCaps(preparsed, ref caps) != HidpStatusSuccess) return false;
-                if (caps.FeatureReportByteLength == 0) return false;
 
-                int capSize = Marshal.SizeOf(typeof(Native.HIDP_VALUE_CAPS));
-                ushort capCount = 64;
-                IntPtr capsBuffer = Marshal.AllocHGlobal(capSize * capCount);
-                try
+                if (caps.FeatureReportByteLength > 0 &&
+                    TryReadFromReports(handle, preparsed, HidpFeature, caps.FeatureReportByteLength, out percent, out detail))
+                    return true;
+
+                if (caps.InputReportByteLength > 0 && ShouldTryInput(info.Path))
                 {
-                    int status = Native.HidP_GetValueCaps(HidpFeature, capsBuffer, ref capCount, preparsed);
-                    if (status != HidpStatusSuccess) return false;
-
-                    for (int i = 0; i < capCount; i++)
-                    {
-                        Native.HIDP_VALUE_CAPS cap = (Native.HIDP_VALUE_CAPS)Marshal.PtrToStructure(
-                            new IntPtr(capsBuffer.ToInt64() + i * capSize), typeof(Native.HIDP_VALUE_CAPS));
-                        if (cap.UsagePage != GenericDeviceControlsPage || cap.BitSize == 0 || cap.ReportCount == 0)
-                            continue;
-
-                        bool match;
-                        if (cap.IsRange != 0)
-                        {
-                            match = cap.Union != null && cap.Union.Length >= 2 &&
-                                cap.Union[0] <= BatteryStrengthUsage && cap.Union[1] >= BatteryStrengthUsage;
-                        }
-                        else
-                        {
-                            match = cap.Union != null && cap.Union.Length >= 1 &&
-                                cap.Union[0] == BatteryStrengthUsage;
-                        }
-                        if (!match) continue;
-
-                        byte[] report = new byte[caps.FeatureReportByteLength];
-                        report[0] = cap.ReportID;
-                        if (!Native.HidD_GetFeature(handle, report, report.Length)) continue;
-
-                        uint value;
-                        int valueStatus = Native.HidP_GetUsageValue(HidpFeature, GenericDeviceControlsPage,
-                            cap.LinkCollection, BatteryStrengthUsage, out value, preparsed, report, (uint)report.Length);
-                        if (valueStatus != HidpStatusSuccess) continue;
-
-                        percent = NormalizePercent(value, cap.LogicalMin, cap.LogicalMax);
-                        detail = "标准 HID 电池字段（Usage 0x06/0x20，报告 ID " +
-                            cap.ReportID.ToString(CultureInfo.InvariantCulture) + "）";
+                    if (TryReadFromReports(handle, preparsed, HidpInput, caps.InputReportByteLength, out percent, out detail))
                         return true;
-                    }
+                    MarkInputUnavailable(info.Path);
                 }
-                finally
-                {
-                    Marshal.FreeHGlobal(capsBuffer);
-                }
+
+                return false;
             }
             finally
             {
                 if (preparsed != IntPtr.Zero) Native.HidD_FreePreparsedData(preparsed);
                 Native.CloseHandle(handle);
             }
+        }
 
+        private static bool ShouldTryInput(string path)
+        {
+            lock (InputSkipLock)
+            {
+                DateTime until;
+                if (InputSkipUntil.TryGetValue(path, out until) && DateTime.UtcNow < until)
+                    return false;
+                return true;
+            }
+        }
+
+        private static void MarkInputUnavailable(string path)
+        {
+            lock (InputSkipLock)
+            {
+                InputSkipUntil[path] = DateTime.UtcNow.AddMinutes(5);
+            }
+        }
+
+        private static bool TryReadFromReports(IntPtr handle, IntPtr preparsed, int reportType,
+            int reportLength, out int percent, out string detail)
+        {
+            percent = -1;
+            detail = "";
+
+            int capSize = Marshal.SizeOf(typeof(Native.HIDP_VALUE_CAPS));
+            ushort capCount = 64;
+            IntPtr capsBuffer = Marshal.AllocHGlobal(capSize * capCount);
+            try
+            {
+                int status = Native.HidP_GetValueCaps(reportType, capsBuffer, ref capCount, preparsed);
+                if (status != HidpStatusSuccess) return false;
+
+                for (int i = 0; i < capCount; i++)
+                {
+                    Native.HIDP_VALUE_CAPS cap = (Native.HIDP_VALUE_CAPS)Marshal.PtrToStructure(
+                        new IntPtr(capsBuffer.ToInt64() + i * capSize), typeof(Native.HIDP_VALUE_CAPS));
+                    if (cap.UsagePage != GenericDeviceControlsPage || cap.BitSize == 0 || cap.ReportCount == 0)
+                        continue;
+
+                    bool match;
+                    if (cap.IsRange != 0)
+                    {
+                        match = cap.Union != null && cap.Union.Length >= 2 &&
+                            cap.Union[0] <= BatteryStrengthUsage && cap.Union[1] >= BatteryStrengthUsage;
+                    }
+                    else
+                    {
+                        match = cap.Union != null && cap.Union.Length >= 1 &&
+                            cap.Union[0] == BatteryStrengthUsage;
+                    }
+                    if (!match) continue;
+
+                    byte[] report = new byte[reportLength];
+                    report[0] = cap.ReportID;
+                    bool read = reportType == HidpFeature
+                        ? Native.HidD_GetFeature(handle, report, report.Length)
+                        : Native.HidD_GetInputReport(handle, report, report.Length);
+                    if (!read) continue;
+
+                    uint value;
+                    int valueStatus = Native.HidP_GetUsageValue(reportType, GenericDeviceControlsPage,
+                        cap.LinkCollection, BatteryStrengthUsage, out value, preparsed, report, (uint)report.Length);
+                    if (valueStatus != HidpStatusSuccess) continue;
+
+                    percent = NormalizePercent(value, cap.LogicalMin, cap.LogicalMax);
+                    detail = "标准 HID 电池字段（Usage 0x06/0x20，" +
+                        (reportType == HidpFeature ? "Feature" : "Input") + " 报告 ID " +
+                        cap.ReportID.ToString(CultureInfo.InvariantCulture) + "）";
+                    return true;
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(capsBuffer);
+            }
             return false;
         }
 
@@ -341,12 +488,15 @@ namespace BatteryTray
                 List<HidInterfaceInfo> group;
                 groups.TryGetValue(receiverKey, out group);
                 DeviceConnection connection = DeviceClassifier.ClassifyConnection(info, group);
-                string vendor = VendorCatalog.GetVendorName(info.Vid);
+                string vendor = VendorCatalog.GetVendorName(info);
                 string vendorLabel = vendor != null ? vendor : "未知品牌";
                 string categoryName = DeviceClassifier.CategoryName(category);
                 string detail = DeviceClassifier.ConnectionName(connection) + "；未读取到电量";
-                if (vendor == "罗技" && category == DeviceCategory.Mouse)
-                    detail = "2.4G；该鼠标未提供电量上报（HID++ 2.0 特性表与 1.0 寄存器均不可用）";
+                KnownDevice known = KnownDevices.Find(info.Vid, info.Pid);
+                if (known != null && !string.IsNullOrEmpty(known.BatteryNote))
+                    detail = DeviceClassifier.ConnectionName(connection) + "；" + known.BatteryNote;
+                else if (vendor == "罗技" && category == DeviceCategory.Mouse)
+                    detail = DeviceClassifier.ConnectionName(connection) + "；该鼠标未提供电量上报（HID++ 2.0 特性表与 1.0 寄存器均不可用）";
 
                 snapshot.Devices.Add(new DeviceBattery
                 {

@@ -130,6 +130,7 @@ namespace BatteryTray
             IBatteryProvider[] providers = new IBatteryProvider[]
             {
                 new LogitechBatteryProvider(),
+                new AjazzBatteryProvider(),
                 new GenericHidBatteryProvider(),
                 new DevicePresenceProvider(),
                 new BluetoothDeviceProvider(),
@@ -214,7 +215,7 @@ namespace BatteryTray
 
         private static DeviceBattery CreateUnsupportedReceiver(string key, HidInterfaceInfo info)
         {
-            string vendor = VendorCatalog.GetVendorName(info.Vid);
+            string vendor = VendorCatalog.GetVendorName(info);
             string label;
             string detail;
             if (info.Vid == 0x26CE)
@@ -230,7 +231,10 @@ namespace BatteryTray
             else
             {
                 label = (vendor != null ? vendor : "未知品牌") + " 2.4G 接收器";
-                detail = "未提供可读的标准 HID 电池字段";
+                KnownDevice known = KnownDevices.Find(info.Vid, info.Pid);
+                detail = known != null && !string.IsNullOrEmpty(known.BatteryNote)
+                    ? known.BatteryNote
+                    : "未提供可读的标准 HID 电池字段";
                 if (!string.IsNullOrEmpty(info.Product))
                     detail += "（" + info.Product + "）";
             }

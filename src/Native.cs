@@ -157,6 +157,9 @@ namespace BatteryTray
         public static extern bool HidD_GetFeature(IntPtr hidDeviceObject, byte[] reportBuffer, int reportBufferLength);
 
         [DllImport("hid.dll", SetLastError = true)]
+        public static extern bool HidD_GetInputReport(IntPtr hidDeviceObject, byte[] reportBuffer, int reportBufferLength);
+
+        [DllImport("hid.dll", SetLastError = true)]
         public static extern int HidP_GetValueCaps(int reportType, IntPtr valueCaps, ref ushort valueCapsLength, IntPtr preparsedData);
 
         [DllImport("hid.dll", SetLastError = true)]
