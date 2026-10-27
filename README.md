@@ -43,7 +43,7 @@ $sources = Get-ChildItem .\src\*.cs | ForEach-Object { $_.FullName }
   $sources
 ```
 
-`BatteryTray.exe` 是编译产物，不纳入版本控制。
+Windows 上也可以直接双击仓库根目录的 `build.cmd`，它会用同样的参数编译并把结果显示出来。`BatteryTray.exe` 是编译产物，不纳入版本控制。
 
 ## 使用
 
